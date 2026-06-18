@@ -1268,6 +1268,81 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
         return draft_token_ids
 
+    def propose_tree(
+        self,
+        num_input_tokens: int,
+        batch_size: int,
+        token_indices_to_sample: torch.Tensor,
+        target_positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        multi_steps_attn_metadata: list | None,
+        num_tokens: int,
+        is_prefill: bool | None = None,
+    ) -> torch.Tensor:
+        """Propose draft tokens using tree structure (layer-by-layer generation).
+        
+        This method implements tree draft generation for branching speculative decoding.
+        It generates draft tokens level by level according to the tree structure.
+        
+        Args:
+            num_input_tokens: Number of input tokens.
+            batch_size: Batch size.
+            token_indices_to_sample: Token indices to sample.
+            target_positions: Target positions.
+            inputs_embeds: Input embeddings.
+            multi_steps_attn_metadata: Multi-step attention metadata.
+            num_tokens: Number of tokens.
+            is_prefill: Whether in prefill stage.
+            
+        Returns:
+            Draft token ids tensor of shape [batch_size, tree_len].
+        """
+        if not hasattr(self, 'tree_plan') or self.tree_plan is None:
+            # Should not happen if validation passed
+            raise RuntimeError("tree_plan not found. Cannot run tree draft.")
+        
+        tree_plan = self.tree_plan
+        tree_len = tree_plan.tree_len
+        tree_depth = tree_plan.tree_depth
+        
+        # Initialize draft token tensor
+        # Shape: [tree_len, batch_size] (will transpose at the end)
+        draft_token_ids = torch.zeros(
+            (tree_len, batch_size),
+            dtype=torch.long,
+            device=self.device,
+        )
+        
+        # Layer-by-layer generation
+        for depth in range(tree_depth + 1):
+            num_nodes_at_level = tree_plan.depth_counts[depth]
+            if num_nodes_at_level == 0:
+                continue
+            
+            # Get parent indices for this level
+            start_idx = tree_plan.cu_drafts_per_level[depth]
+            end_idx = tree_plan.cu_drafts_per_level[depth + 1]
+            
+            # TODO: Implement actual layer-by-layer draft generation
+            # For now, just log that we would generate drafts at this level
+            logger.info(
+                f"Tree draft: generating {num_nodes_at_level} drafts at depth {depth}"
+            )
+            
+            # Placeholder: generate dummy draft tokens
+            # In real implementation, this should:
+            # 1. Get parent hidden states
+            # 2. Run model to get logits
+            # 3. Sample draft tokens
+            # 4. Update hidden states, positions, slot_mapping
+            for i in range(num_nodes_at_level):
+                node_idx = start_idx + i
+                # Placeholder: just set to a dummy token
+                draft_token_ids[node_idx] = 0
+        
+        # Transpose to [batch_size, tree_len]
+        return draft_token_ids.swapaxes(0, 1)
+
     def set_inputs_first_pass(
         self,
         target_token_ids: torch.Tensor,

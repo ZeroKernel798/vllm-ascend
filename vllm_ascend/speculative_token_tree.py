@@ -211,3 +211,143 @@ def is_ascend_experimental_tree_attention_enabled(vllm_config: object) -> bool:
     return bool(additional_config.get(
         ASCEND_EXPERIMENTAL_TREE_ATTENTION_CONFIG_KEY, False
     ))
+
+
+def build_speculative_token_tree_plan(
+    tree_choices: list[list[int]],
+) -> SpeculativeTokenTreePlan:
+    """Build a pre-computed plan for uniform speculative token tree.
+    
+    Args:
+        tree_choices: List of ancestor chains for each draft token.
+        
+    Returns:
+        SpeculativeTokenTreePlan with pre-computed tree structure info.
+        
+    Raises:
+        ValueError: If tree is not uniform (different parents have different number of children).
+    """
+    if not tree_choices:
+        raise ValueError("tree_choices must not be empty")
+    
+    tree_len = len(tree_choices)
+    tree_depth = max(len(chain) for chain in tree_choices)
+    
+    # Calculate depth counts
+    depth_counts = [0] * (tree_depth + 1)
+    for chain in tree_choices:
+        depth = len(chain)
+        depth_counts[depth] += 1
+    
+    # Calculate cumulative drafts per level
+    cu_drafts_per_level = [0]
+    for count in depth_counts:
+        cu_drafts_per_level.append(cu_drafts_per_level[-1] + count)
+    
+    # Calculate children per level (assuming uniform tree)
+    child_drafts_per_level = []
+    for depth_idx in range(tree_depth):
+        if depth_idx == 0:
+            # Root level: number of children = depth_counts[1]
+            child_drafts_per_level.append(depth_counts[1])
+        else:
+            # Subsequent levels: check uniformity
+            parent_count = depth_counts[depth_idx]
+            child_count = depth_counts[depth_idx + 1]
+            if parent_count == 0:
+                child_drafts_per_level.append(0)
+            else:
+                # Check if uniform
+                if child_count % parent_count != 0:
+                    raise ValueError(
+                        f"Non-uniform tree: level {depth_idx} has {parent_count} parents "
+                        f"but {child_count} children"
+                    )
+                child_drafts_per_level.append(child_count // parent_count)
+    
+    # Calculate parent indices
+    parent_indices = []
+    for chain in tree_choices:
+        # Parent is the last element in the chain
+        parent = chain[-1]
+        parent_indices.append(parent)
+    
+    return SpeculativeTokenTreePlan(
+        tree_choices=tree_choices,
+        depth_counts=depth_counts,
+        cu_drafts_per_level=cu_drafts_per_level,
+        child_drafts_per_level=child_drafts_per_level,
+        parent_indices=parent_indices,
+        tree_depth=tree_depth,
+        tree_len=tree_len,
+    )
+
+
+def prepare_speculative_token_tree_attn_bias(
+    tree_choices: list[list[int]],
+) -> torch.Tensor:
+    """Prepare attention bias matrix for speculative token tree.
+    
+    Args:
+        tree_choices: List of ancestor chains.
+        
+    Returns:
+        Tensor of shape (tree_len, tree_len) with 0 for visible and -inf for masked.
+    """
+    tree_len = len(tree_choices)
+    tree_plan = build_speculative_token_tree_plan(tree_choices)
+    
+    # Initialize with -inf (all masked)
+    attn_bias = torch.full(
+        (tree_len, tree_len),
+        float('-inf'),
+        dtype=torch.float32,
+    )
+    
+    # Root (index 0) can see itself
+    attn_bias[0, 0] = 0
+    
+    # For each draft token, make its ancestors visible
+    for idx, chain in enumerate(tree_choices):
+        # Token can see itself
+        attn_bias[idx + 1, idx + 1] = 0
+        
+        # Token can see its ancestors
+        for ancestor in chain:
+            attn_bias[idx + 1, ancestor] = 0
+    
+    return attn_bias
+
+
+def sort_speculative_token_tree(
+    tree_choices: list[list[int]],
+) -> list[list[int]]:
+    """Sort tree choices in breadth-first order.
+    
+    Args:
+        tree_choices: List of ancestor chains.
+        
+    Returns:
+        Sorted tree choices in breadth-first order.
+    """
+    # Sort by (depth, chain) for breadth-first order
+    sorted_tree = sorted(
+        enumerate(tree_choices),
+        key=lambda x: (len(x[1]), x[1])
+    )
+    return [item[1] for item in sorted_tree]
+
+
+def get_speculative_token_tree_depth_counts(
+    tree_choices: list[list[int]],
+) -> list[int]:
+    """Get number of draft tokens at each depth.
+    
+    Args:
+        tree_choices: List of ancestor chains.
+        
+    Returns:
+        List where index i contains number of tokens at depth i.
+    """
+    tree_plan = build_speculative_token_tree_plan(tree_choices)
+    return tree_plan.depth_counts
