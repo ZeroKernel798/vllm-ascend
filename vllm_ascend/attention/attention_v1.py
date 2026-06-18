@@ -208,6 +208,14 @@ class AscendMetadata:
     reshape_cache_event: torch.npu.Event = None
 
     kvcomp_metadata: KVCompMetaData | None = None
+    
+    # ********************** Tree Attention Properties ********************* #
+    # Tree attention mask (4D, BNSD layout) for branching speculative decoding
+    tree_attn_mask_4d: torch.Tensor | None = None
+    # Whether to use tree attention (branching speculative decoding)
+    use_tree_attention: bool = False
+    # Context length for tree attention verify stage
+    tree_context_len: int = 0
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -310,6 +318,41 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
+        # ********************** Tree Attention Support ********************* #
+        tree_attn_mask_4d = None
+        use_tree_attention = False
+        tree_context_len = 0
+        
+        # Check if tree attention is enabled (branching speculative decoding)
+        if self.speculative_config and hasattr(self.speculative_config, 'speculative_token_tree'):
+            from vllm_ascend.speculative_token_tree import (
+                is_ascend_experimental_tree_attention_enabled,
+                is_linear_speculative_token_tree,
+            )
+            from vllm_ascend.attention.tree_attention_v1 import AscendTreeAttentionMetadataBuilder
+            
+            # Check if experimental tree attention is enabled
+            experimental_enabled = is_ascend_experimental_tree_attention_enabled(self.vllm_config)
+            
+            if experimental_enabled:
+                tree = self.speculative_config.speculative_token_tree
+                # Only enable tree attention for branching trees (not linear chain)
+                if tree and not is_linear_speculative_token_tree(tree):
+                    # Build tree attention metadata
+                    tree_builder = AscendTreeAttentionMetadataBuilder(self.vllm_config)
+                    tree_metadata = tree_builder.build(seq_lens.tolist())
+                    
+                    if tree_metadata is not None and tree_metadata.tree_attn_mask is not None:
+                        # Use 4D tree attention mask (BNSD layout)
+                        tree_attn_mask_4d = tree_metadata.tree_attn_mask
+                        use_tree_attention = True
+                        tree_context_len = tree_metadata.tree_context_len
+                        
+                        # For tree attention, we need to modify attn_mask to include tree structure
+                        # Reference: EAGLE implementation - fuse tree mask into 4D attention mask
+                        # The tree_attn_mask_4d is already in BNSD layout [1, 1, tree_len, tree_len]
+                        # We'll use this mask in the attention computation
+
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
@@ -328,6 +371,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
             kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
+            # Tree attention fields
+            tree_attn_mask_4d=tree_attn_mask_4d,
+            use_tree_attention=use_tree_attention,
+            tree_context_len=tree_context_len,
         )
         return attn_metadata
 
@@ -710,11 +757,38 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Get workspace from cache or calculate it if not present.
         workspace = graph_params.workspaces.get(num_tokens)
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
-        input_layout = "TND"
-        attn_mask = attn_metadata.attn_mask
-        sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
-        pre_tokens = self.sliding_window or SWA_INT_MAX
-        next_tokens = 0 if self.sliding_window else SWA_INT_MAX
+        
+        # ********************** Tree Attention Support ********************* #
+        # Check if tree attention is enabled (branching speculative decoding)
+        if getattr(attn_metadata, 'use_tree_attention', False):
+            # Use BNSD layout for tree attention (reference: EAGLE implementation)
+            input_layout = "BNSD"
+            # Use 4D tree attention mask (already in BNSD layout)
+            attn_mask = attn_metadata.tree_attn_mask_4d
+            # For tree attention, we provide full 4D mask, so sparse_mode=0
+            sparse_mode = 0
+            pre_tokens = SWA_INT_MAX
+            next_tokens = SWA_INT_MAX
+            
+            # Reshape query for BNSD layout: [num_tokens, num_heads, head_size] -> [batch, num_heads, seq_len, head_size]
+            # TODO: Need to handle batch dimension properly for tree attention
+            # For now, assume single request (batch=1)
+            batch_size = 1  # TODO: Get actual batch size
+            seq_len = num_tokens // batch_size
+            query = query.view(batch_size, self.num_heads, seq_len, self.head_size)
+            output = output.view(batch_size, self.num_heads, seq_len, self.head_size)
+            
+            # Reshape key and value for BNSD layout
+            _, block_size, _, _ = self.key_cache.shape
+            key = self._nz_5d_view(self.key_cache, block_size)
+            value = self._nz_5d_view(self.value_cache, block_size)
+        else:
+            # Standard attention (TND layout)
+            input_layout = "TND"
+            attn_mask = attn_metadata.attn_mask
+            sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
+            pre_tokens = self.sliding_window or SWA_INT_MAX
+            next_tokens = 0 if self.sliding_window else SWA_INT_MAX
 
         extra_args = {}
         if self.enable_c8_quant and layer is not None:

@@ -105,14 +105,15 @@ class AscendTreeAttentionMetadataBuilder:
         # Prepare attention bias
         tree_attn_bias = prepare_speculative_token_tree_attn_bias(tree)
         
-        # Convert bias to mask (Ascend format: 0=visible, 1=masked)
-        tree_attn_mask = self._convert_bias_to_mask(tree_attn_bias)
+        # Convert bias to 4D attention mask (BNSD layout: [1, 1, tree_len, tree_len])
+        # Reference: EAGLE implementation - fuse tree mask into 4D attention mask
+        tree_attn_mask_4d = self._convert_bias_to_4d_mask(tree_attn_bias, dtype=torch.float16)
         
         return AscendTreeAttentionMetadata(
             tree_choices=tree,
             tree_depth_counts=tree_plan.depth_counts,
             tree_attn_bias=tree_attn_bias,
-            tree_attn_mask=tree_attn_mask,
+            tree_attn_mask=tree_attn_mask_4d,  # 4D mask for BNSD layout
             experimental_tree_attention_enabled=True,
             tree_context_len=tree_context_len,
         )
@@ -176,3 +177,41 @@ class AscendTreeAttentionMetadataBuilder:
             torch.zeros_like(tree_attn_bias, dtype=torch.int8),
         )
         return tree_attn_mask
+        
+    def _convert_bias_to_4d_mask(
+        self,
+        tree_attn_bias: torch.Tensor,
+        dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        """Convert attention bias to 4D attention mask (BNSD layout).
+        
+        Reference: EAGLE implementation - fuse tree mask into 4D attention mask.
+        Shape: [1, 1, tree_len, tree_len]
+        
+        Args:
+            tree_attn_bias: 2D bias matrix with 0/-inf, shape [tree_len, tree_len].
+            dtype: Data type for the mask (default: float16).
+            
+        Returns:
+            4D attention mask with -inf for masked positions, shape [1, 1, tree_len, tree_len].
+        """
+        if tree_attn_bias is None:
+            return None
+            
+        tree_len = tree_attn_bias.shape[0]
+        
+        # Convert 2D bias to 4D mask (BNSD layout)
+        # EAGLE approach: set masked positions to -inf (softmax -> 0)
+        mask_value = float("-inf") if dtype == torch.float16 else 1.0
+        
+        # Create 4D mask: [1, 1, tree_len, tree_len]
+        tree_attn_mask_4d = torch.zeros(
+            (1, 1, tree_len, tree_len), dtype=dtype, device=tree_attn_bias.device
+        )
+        
+        # Apply tree mask: masked positions -> -inf
+        # tree_attn_bias: 0=visible, -inf=masked
+        masked_positions = torch.isinf(tree_attn_bias)
+        tree_attn_mask_4d[:, :, masked_positions] = mask_value
+        
+        return tree_attn_mask_4d
