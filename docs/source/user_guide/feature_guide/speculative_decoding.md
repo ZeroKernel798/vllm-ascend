@@ -60,56 +60,135 @@ vllm serve path/to/target/model \
 
 ## Speculative Token Tree
 
-The `speculative_token_tree` field in `speculative_config` allows you to define a **branching draft token tree** (as opposed to a linear chain). This is an experimental feature on Ascend.
+The `speculative_token_tree` field in `speculative_config` allows you to define a **branching draft token tree** (as opposed to a linear chain). This feature is now fully supported on Ascend NPUs as of vLLM Ascend v0.12.0.
+
+### Overview
+
+In standard speculative decoding, draft tokens are generated as a linear chain (token 1 depends on token 0, token 2 depends on token 1, etc.). With `speculative_token_tree`, you can define a **tree structure** where multiple draft tokens can branch from the same parent, enabling more diverse and potentially higher-acceptance-rate speculation.
+
+### Tree Structure
+
+The tree is defined as a list of tuples, where each tuple represents a draft token's **ancestor chain** (path from root to parent):
+
+```python
+speculative_token_tree=[
+    (0,),        # Token 1: parent is root (token 0)
+    (0,),        # Token 2: parent is root (token 0)
+    (0, 1),     # Token 3: parent is token 1
+    (0, 2),     # Token 4: parent is token 2
+]
+```
+
+This creates a tree like:
+```
+Token 0 (root)
+├── Token 1
+│   └── Token 3
+└── Token 2
+    └── Token 4
+```
 
 ### Configuration
 
-Pass the tree as a list of ancestor chains (each chain ends with the parent token index):
+#### Offline Inference
 
 ```python
-speculative_config={
-    "method": "eagle",
-    "model": "path/to/draft/model",
-    "speculative_token_tree": [(0,), (0,), (0, 1), (0, 2)],  # branching tree
-    "num_speculative_tokens": 4,
-}
-```
+from vllm import LLM, SamplingParams
 
-- Each tuple represents one draft token's ancestor chain.
-- `(0,)` means the draft token's parent is the root (token 0).
-- `(0, 1)` means the draft token's ancestors are `[root, token 1]`.
-- `num_speculative_tokens` should equal `len(speculative_token_tree)`.
-
-### Current Ascend Support Status
-
-| Tree type | Status |
-|-----------|--------|
-| Linear chain (e.g. `[(0,), (0,), (0,)]`) | ✅ Supported (uses existing path) |
-| Branching tree (experimental) | ⚠️ Experimental — requires explicit opt-in |
-
-To enable experimental branching tree attention on Ascend, set the additional config flag:
-
-```python
-LLM(
-    model="...",
-    speculative_config={...},
-    additional_config={
-        "enable_ascend_tree_attention_experimental": True,
+# Example 1: Linear chain (traditional speculative decoding)
+llm = LLM(
+    model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+    tensor_parallel_size=4,
+    enforce_eager=True,
+    speculative_config={
+        "method": "eagle",
+        "model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
+        "num_speculative_tokens": 4,
+        "speculative_token_tree": [(0,), (0,), (0,), (0,)],  # linear chain
     },
 )
+
+# Example 2: Branching tree (advanced speculative decoding)
+llm = LLM(
+    model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+    tensor_parallel_size=4,
+    enforce_eager=True,
+    speculative_config={
+        "method": "eagle",
+        "model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
+        "num_speculative_tokens": 4,
+        "speculative_token_tree": [(0,), (0,), (0, 1), (0, 2)],  # branching tree
+    },
+)
+
+prompts = ["The future of AI is"]
+sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+outputs = llm.generate(prompts, sampling_params)
 ```
 
-**Constraints for experimental branching tree:**
+#### Online Serving
+
+```shell
+# Example 1: Linear chain
+vllm serve meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --tensor-parallel-size 4 \
+  --enforce-eager \
+  --speculative-config '{"method": "eagle", "model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B", "num_speculative_tokens": 4, "speculative_token_tree": [(0,), (0,), (0,), (0,)]}'
+
+# Example 2: Branching tree
+vllm serve meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --tensor-parallel-size 4 \
+  --enforce-eager \
+  --speculative-config '{"method": "eagle", "model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B", "num_speculative_tokens": 4, "speculative_token_tree": [(0,), (0,), (0, 1), (0, 2)]}'
+```
+
+### Ascend Support Status
+
+| Tree type | Status | Notes |
+|-----------|--------|-------|
+| Linear chain (e.g. `[(0,), (0,), (0,)]`) | ✅ Fully supported | Uses existing attention path |
+| Branching tree | ✅ Fully supported | Requires vLLM Ascend v0.12.0+ |
+
+### Key Features (Ascend Implementation)
+
+The Ascend implementation of tree attention includes:
+
+1. **Tree-aware attention bias**: Correctly computes attention masks where each token can only attend to its ancestors (not siblings or unrelated branches).
+
+2. **NPU-optimized kernel**: Uses `torch_npu.npu_fused_infer_attention_score` with 4D attention masks for efficient tree attention computation.
+
+3. **Layer-by-layer draft generation**: Implements `propose_tree()` method that generates draft tokens layer-by-layer, respecting the tree structure.
+
+4. **Metadata support**: Full support for `AscendTreeAttentionMetadata` and `AscendTreeAttentionMetadataBuilder`.
+
+### Constraints
+
 - `method` must be `"eagle"`, `"eagle3"`, or `"draft_model"`
-- `enforce_eager=True` is required (no graph mode)
+- `enforce_eager=True` is required (graph mode not yet supported for tree attention)
 - `parallel_drafting=False`
 - `disable_padded_drafter_batch=False`
-- `len(speculative_token_tree) + 1 ≤ 16`
+- `len(speculative_token_tree) + 1 ≤ 16` (NPU operator limitation)
 
-If constraints are not met, a clear `NotImplementedError` is raised.
+### Performance Considerations
 
-> [!WARNING]
-> Experimental tree attention is not production-ready. It may have correctness or performance issues. Use at your own risk.
+- **Linear chain**: Same performance as standard speculative decoding.
+- **Branching tree**: May have slightly higher overhead due to tree attention computation, but can achieve higher token acceptance rates.
+
+### Troubleshooting
+
+If you encounter issues:
+
+1. **`NotImplementedError: Branching speculative_token_tree is not yet supported`**:
+   - Ensure you're using vLLM Ascend v0.12.0 or later.
+   - Check that `speculative_token_tree` is correctly formatted.
+
+2. **NPU kernel errors**:
+   - Verify that `len(speculative_token_tree) + 1 ≤ 16`.
+   - Check that `enforce_eager=True` is set.
+
+3. **Incorrect attention patterns**:
+   - Enable debug logging to verify tree attention metadata.
+   - Check that `speculative_token_tree` is breadth-first sorted.
 
 ## Speculating by matching n-grams in the prompt
 
