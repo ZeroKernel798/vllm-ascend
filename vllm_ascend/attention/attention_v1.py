@@ -733,14 +733,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
         layer=None,
     ) -> torch.Tensor:
-        passed_key = key
-        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
-        if self.enable_hamming_sparse and attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
-            reshape_and_cache_kvcomp(attn_metadata.kvcomp_metadata, self.layerIndex, passed_key)
-        elif self.enable_hamming_sparse:
-            block_table, actual_seq_lengths_kv = get_kvcomp_decode_params(
-                self.layerIndex, attn_metadata.kvcomp_metadata, query, passed_key, block_table, actual_seq_lengths_kv
-            )
+        # Check if tree attention is enabled
+        use_tree_attention = getattr(attn_metadata, 'use_tree_attention', False)
+        
+        if not use_tree_attention:
+            # Standard attention: use KV cache
+            passed_key = key
+            key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
+            if self.enable_hamming_sparse and attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+                reshape_and_cache_kvcomp(attn_metadata.kvcomp_metadata, self.layerIndex, passed_key)
+            elif self.enable_hamming_sparse:
+                block_table, actual_seq_lengths_kv = get_kvcomp_decode_params(
+                    self.layerIndex, attn_metadata.kvcomp_metadata, query, passed_key, block_table, actual_seq_lengths_kv
+                )
+        else:
+            # Tree attention: don't use KV cache, will set params later
+            block_size = 0
+            block_table = None
+            actual_seq_lengths_kv = None
 
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         if _EXTRA_CTX.is_draft_model:
@@ -770,18 +780,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
             pre_tokens = SWA_INT_MAX
             next_tokens = SWA_INT_MAX
             
-            # Reshape query for BNSD layout: [num_tokens, num_heads, head_size] -> [batch, num_heads, seq_len, head_size]
-            # TODO: Need to handle batch dimension properly for tree attention
-            # For now, assume single request (batch=1)
-            batch_size = 1  # TODO: Get actual batch size
-            seq_len = num_tokens // batch_size
-            query = query.view(batch_size, self.num_heads, seq_len, self.head_size)
-            output = output.view(batch_size, self.num_heads, seq_len, self.head_size)
+            # For tree attention, we DON'T use KV cache
+            # Instead, we use the key and value directly (all tokens' KV)
+            # key/value shape: [num_tokens, num_kv_heads * head_size] (TND layout)
+            # Reshape to BNSD layout: [1, num_kv_heads, num_tokens, head_size]
+            seq_len = num_tokens
+            key = key.view(seq_len, self.num_kv_heads, self.head_size).unsqueeze(0)
+            value = value.view(seq_len, self.num_kv_heads, self.head_size).unsqueeze(0)
             
-            # Reshape key and value for BNSD layout
-            _, block_size, _, _ = self.key_cache.shape
-            key = self._nz_5d_view(self.key_cache, block_size)
-            value = self._nz_5d_view(self.value_cache, block_size)
+            # Reshape query for BNSD layout: [num_tokens, num_heads, head_size] -> [1, num_heads, seq_len, head_size]
+            query = query.view(seq_len, self.num_heads, self.head_size).unsqueeze(0)
+            output = output.view(seq_len, self.num_heads, self.head_size).unsqueeze(0)
+            
+            # Tree attention uses non-paged attention (no block table)
+            block_table = None
+            block_size = 0
+            actual_seq_lengths_kv = [seq_len]
         else:
             # Standard attention (TND layout)
             input_layout = "TND"
@@ -836,11 +850,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 update_graph_params_workspaces(num_tokens, workspace)
 
         # Handle graph capturing mode
-        stream = torch_npu.npu.current_stream()
+        stream = torch.npu.current_stream()
 
         event = torch.npu.ExternalEvent()
         event.wait(stream)
         event.reset(stream)
+        
+        # For tree attention, we need to ensure the shapes are correct for graph capturing
+        if use_tree_attention:
+            # Tree attention uses BNSD layout
+            # query shape: [1, num_heads, seq_len, head_size]
+            # key shape: [1, num_kv_heads, seq_len, head_size]
+            # value shape: [1, num_kv_heads, seq_len, head_size]
+            # output shape: [1, num_heads, seq_len, head_size]
+            pass
+        
         graph_params.events[num_tokens].append(event)
         attn_params = (
             weak_ref_tensors(query),
@@ -893,7 +917,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             **extra_args,
         )
 
-        output = output.view(num_tokens, self.num_heads, self.head_size)
+        # Reshape output based on input layout
+        if input_layout == "BNSD":
+            # Output shape: [1, num_heads, seq_len, head_size] (BNSD layout)
+            # Reshape to: [num_tokens, num_heads * head_size] (TND layout)
+            output = output.squeeze(0).view(num_tokens, self.num_heads * self.head_size)
+        else:
+            # Output shape: [num_tokens, num_heads, head_size] (TND layout)
+            output = output.view(num_tokens, self.num_heads, self.head_size)
 
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
