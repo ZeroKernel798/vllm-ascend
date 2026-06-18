@@ -292,14 +292,15 @@ def prepare_speculative_token_tree_attn_bias(
         tree_choices: List of ancestor chains.
         
     Returns:
-        Tensor of shape (tree_len, tree_len) with 0 for visible and -inf for masked.
+        Tensor of shape (tree_len + 1, tree_len + 1) with 0 for visible and -inf for masked.
+        Index 0 is the root token, indices 1 to tree_len are draft tokens.
     """
     tree_len = len(tree_choices)
-    tree_plan = build_speculative_token_tree_plan(tree_choices)
     
-    # Initialize with -inf (all masked)
+    # Bias matrix includes root (index 0) + draft tokens
+    # Shape: (tree_len + 1, tree_len + 1)
     attn_bias = torch.full(
-        (tree_len, tree_len),
+        (tree_len + 1, tree_len + 1),
         float('-inf'),
         dtype=torch.float32,
     )
@@ -307,14 +308,25 @@ def prepare_speculative_token_tree_attn_bias(
     # Root (index 0) can see itself
     attn_bias[0, 0] = 0
     
-    # For each draft token, make its ancestors visible
+    # For each draft token (idx 0 to tree_len-1 in tree_choices)
+    # Its position in bias matrix is idx + 1
     for idx, chain in enumerate(tree_choices):
+        draft_idx = idx + 1
+        
         # Token can see itself
-        attn_bias[idx + 1, idx + 1] = 0
+        attn_bias[draft_idx, draft_idx] = 0
         
         # Token can see its ancestors
+        # Ancestors are indexed by their position in tree_choices (0-based)
+        # Root is 0, draft tokens are 1, 2, ...
         for ancestor in chain:
-            attn_bias[idx + 1, ancestor] = 0
+            # ancestor is the index in tree_choices
+            # If ancestor is 0, it means root -> bias index 0
+            # If ancestor is i > 0, it means the i-th draft token -> bias index i+1
+            if ancestor == 0:
+                attn_bias[draft_idx, 0] = 0
+            else:
+                attn_bias[draft_idx, ancestor + 1] = 0
     
     return attn_bias
 
