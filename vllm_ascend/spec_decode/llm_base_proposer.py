@@ -52,6 +52,10 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled, vllm_version_is
+from vllm_ascend.speculative_token_tree import (
+    is_ascend_experimental_tree_attention_enabled,
+    validate_ascend_speculative_token_tree_support,
+)
 
 if vllm_version_is("0.22.1"):
     from vllm.distributed.parallel_state import patch_tensor_parallel_group  # type: ignore[import-not-found]
@@ -159,6 +163,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
         self.arange_cpu = torch.arange(self.arange.shape[0], device="cpu", dtype=torch.int32)
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+
+        # Phase 1: Validate speculative token tree support
+        self.experimental_tree_attention_enabled = is_ascend_experimental_tree_attention_enabled(
+            self.vllm_config
+        )
+        if hasattr(self.speculative_config, 'speculative_token_tree'):
+            validate_ascend_speculative_token_tree_support(
+                self.speculative_config,
+                self.vllm_config,
+                enable_experimental_tree_attention=self.experimental_tree_attention_enabled,
+            )
 
         self.enable_shared_expert_dp = shared_expert_dp_enabled()
 

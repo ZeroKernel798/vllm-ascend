@@ -2,6 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm_ascend.speculative_token_tree import (  # noqa: F401
+    ASCEND_EXPERIMENTAL_TREE_ATTENTION_CONFIG_KEY,
+    is_ascend_experimental_tree_attention_enabled,
+    is_linear_speculative_token_tree,
+    parse_speculative_token_tree,
+    validate_ascend_speculative_token_tree_support,
+)
+
 
 def update_num_computed_tokens_for_batch_change(
     num_computed_tokens: torch.Tensor,
