@@ -970,6 +970,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
+            # Check if we should use tree draft generation
+            use_tree_draft = (
+                hasattr(self, 'tree_plan') and 
+                self.tree_plan is not None and
+                self.speculative_config.speculative_token_tree is not None and
+                not is_linear_speculative_token_tree(self.speculative_config.speculative_token_tree)
+            )
+
+            if use_tree_draft:
+                # Use tree draft generation (layer-by-layer)
+                logger.info("Using tree draft generation for branching speculative decoding")
+                draft_token_ids = self.propose_tree(
+                    num_input_tokens=num_input_tokens,
+                    batch_size=batch_size,
+                    token_indices_to_sample=self.token_indices_to_sample[:token_indices_to_sample_len],
+                    target_positions=target_positions,
+                    inputs_embeds=inputs_embeds,
+                    multi_steps_attn_metadata=multi_steps_attn_metadata,
+                    num_tokens=num_tokens,
+                    is_prefill=attn_metadata_i.num_prefills,
+                )
+                return draft_token_ids
+
             model_inputs: dict[str, Any] = {
                 "num_input_tokens": num_input_tokens,
                 "batch_size": batch_size,
@@ -1298,7 +1321,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             Draft token ids tensor of shape [batch_size, tree_len].
         """
         if not hasattr(self, 'tree_plan') or self.tree_plan is None:
-            # Should not happen if validation passed
             raise RuntimeError("tree_plan not found. Cannot run tree draft.")
         
         tree_plan = self.tree_plan
@@ -1313,32 +1335,131 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             device=self.device,
         )
         
+        # Store hidden states for each node in the tree
+        # Root hidden state is from the target model
+        # Shape: [batch_size, hidden_size]
+        node_hidden_states = torch.zeros(
+            (tree_len + 1, batch_size, self.hidden_size),
+            dtype=self.hidden_states.dtype,
+            device=self.device,
+        )
+        # Root (index 0) uses the initial hidden_states
+        node_hidden_states[0] = self.hidden_states[:batch_size]
+        
+        # Store positions for each node
+        node_positions = torch.zeros(
+            (tree_len + 1, batch_size),
+            dtype=torch.long,
+            device=self.device,
+        )
+        # Root position
+        node_positions[0] = target_positions[:batch_size]
+        
         # Layer-by-layer generation
-        for depth in range(tree_depth + 1):
+        for depth in range(1, tree_depth + 1):
             num_nodes_at_level = tree_plan.depth_counts[depth]
             if num_nodes_at_level == 0:
                 continue
             
-            # Get parent indices for this level
+            # Get node indices for this level
             start_idx = tree_plan.cu_drafts_per_level[depth]
             end_idx = tree_plan.cu_drafts_per_level[depth + 1]
             
-            # TODO: Implement actual layer-by-layer draft generation
-            # For now, just log that we would generate drafts at this level
-            logger.info(
-                f"Tree draft: generating {num_nodes_at_level} drafts at depth {depth}"
+            logger.debug(
+                f"Tree draft: generating {num_nodes_at_level} drafts at depth {depth} "
+                f"(nodes {start_idx} to {end_idx - 1})"
             )
             
-            # Placeholder: generate dummy draft tokens
-            # In real implementation, this should:
-            # 1. Get parent hidden states
-            # 2. Run model to get logits
-            # 3. Sample draft tokens
-            # 4. Update hidden states, positions, slot_mapping
-            for i in range(num_nodes_at_level):
-                node_idx = start_idx + i
-                # Placeholder: just set to a dummy token
-                draft_token_ids[node_idx] = 0
+            # Get parent indices for nodes at this level
+            # For each node at this level, find its parent
+            level_node_indices = list(range(start_idx, end_idx))
+            parent_indices = [tree_plan.parent_indices[idx] for idx in level_node_indices]
+            
+            # Get parent hidden states (parents are at depth-1)
+            # Parent index in node_hidden_states: parent_idx (0 for root, 1+ for drafts)
+            parent_hidden_states = node_hidden_states[parent_indices]  # [num_nodes, batch_size, hidden_size]
+            
+            # Reshape for batch processing: [num_nodes * batch_size, hidden_size]
+            batch_parent_hidden = parent_hidden_states.view(-1, self.hidden_size)
+            
+            # Get parent positions
+            parent_positions = node_positions[parent_indices]  # [num_nodes, batch_size]
+            batch_parent_positions = parent_positions.view(-1)  # [num_nodes * batch_size]
+            
+            # Create input_ids from draft_token_ids (for embedding lookup if needed)
+            # For the first level, we use the root's hidden state directly
+            # For subsequent levels, we need to run the model
+            
+            # Run model for all nodes at this level in batch
+            # Prepare inputs
+            input_ids = torch.zeros(
+                num_nodes_at_level * batch_size,
+                dtype=torch.long,
+                device=self.device,
+            )
+            
+            # TODO: Handle embedding lookup properly
+            # For now, assume we can run model with hidden_states input
+            
+            # Run the model
+            forward_context = get_forward_context()
+            _EXTRA_CTX.num_tokens = num_nodes_at_level * batch_size
+            _EXTRA_CTX.num_accept_tokens = batch_size
+            
+            if forward_context is not None:
+                forward_context.moe_layer_index = 0
+            
+            # Prepare model inputs
+            model_input_ids = input_ids
+            model_positions = batch_parent_positions
+            model_hidden_states = batch_parent_hidden
+            
+            # TODO: Handle multi_steps_attn_metadata for tree attention
+            # For now, use the first draft step's metadata
+            if multi_steps_attn_metadata:
+                forward_context.attn_metadata = multi_steps_attn_metadata[1]
+            else:
+                forward_context.attn_metadata = None
+            
+            model_kwargs = {
+                "input_ids": model_input_ids,
+                "positions": model_positions,
+                "inputs_embeds": None,
+            }
+            if self.pass_hidden_states_to_model:
+                model_kwargs["hidden_states"] = model_hidden_states
+            
+            # Run model
+            ret_hidden_states = self.model(**model_kwargs)
+            if not self.model_returns_tuple():
+                last_hidden_states = ret_hidden_states
+                hidden_states = last_hidden_states
+            else:
+                last_hidden_states, hidden_states = ret_hidden_states
+            
+            # Compute logits and sample draft tokens
+            # Reshape back to [num_nodes, batch_size, hidden_size]
+            last_hidden_states = last_hidden_states.view(num_nodes_at_level, batch_size, -1)
+            
+            # For each node, compute logits and sample
+            for i, node_idx in enumerate(level_node_indices):
+                # Get hidden states for this node across all batches
+                node_hidden = last_hidden_states[i]  # [batch_size, hidden_size]
+                
+                # Compute logits
+                if self.method in ("eagle3", "dflash") and get_ascend_config().enable_reduce_sample:
+                    draft_tokens = self.compute_draft_token_ids(node_hidden)
+                else:
+                    logits = self.model.compute_logits(node_hidden)
+                    draft_tokens = logits.argmax(dim=-1)
+                
+                # Store draft token ids (node_idx is 0-based in tree_choices)
+                # In draft_token_ids, we use node_idx (0 to tree_len-1)
+                draft_token_ids[node_idx] = draft_tokens
+                
+                # Update hidden states for this node (for children at next level)
+                node_hidden_states[node_idx + 1] = hidden_states[i * batch_size:(i + 1) * batch_size]
+                node_positions[node_idx + 1] = batch_parent_positions[i * batch_size:(i + 1) * batch_size] + 1
         
         # Transpose to [batch_size, tree_len]
         return draft_token_ids.swapaxes(0, 1)
