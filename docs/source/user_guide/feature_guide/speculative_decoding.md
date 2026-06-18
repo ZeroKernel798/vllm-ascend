@@ -174,6 +174,24 @@ The Ascend implementation of tree attention includes:
 - **Linear chain**: Same performance as standard speculative decoding.
 - **Branching tree**: May have slightly higher overhead due to tree attention computation, but can achieve higher token acceptance rates.
 
+**Performance Benchmark Results** (Ascend910B2C):
+
+| Config | Standard (ms) | Linear Tree (ms) | Branching Tree (ms) | Overhead |
+|--------|-----------------|-------------------|----------------------|----------|
+| Small (5 tokens) | 0.022 | 0.022 | 0.022 | -2.0% ~ -2.1% |
+| Medium (10 tokens) | 0.023 | 0.021 | 0.022 | -5.2% ~ -5.8% |
+| Large (20 tokens) | 0.025 | 0.024 | 0.024 | -3.0% ~ -3.5% |
+
+**Key Findings**:
+- Tree attention has **minimal performance overhead** (< 5% in micro-benchmarks)
+- No significant difference between linear and branching trees
+- For detailed performance analysis, see [Speculative Token Tree Performance Report](../../../performance/speculative_token_tree_performance.md)
+
+**Recommendations**:
+- Safely use branching trees without significant performance degradation
+- Profile your specific workload to understand end-to-end impact
+- Monitor token acceptance rates to quantify the benefit of branching trees
+
 ### Troubleshooting
 
 If you encounter issues:
