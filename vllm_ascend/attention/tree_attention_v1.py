@@ -181,7 +181,7 @@ class AscendTreeAttentionMetadataBuilder:
     def _convert_bias_to_4d_mask(
         self,
         tree_attn_bias: torch.Tensor,
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype = torch.bool,
     ) -> torch.Tensor:
         """Convert attention bias to 4D attention mask (BNSD layout).
         
@@ -190,28 +190,27 @@ class AscendTreeAttentionMetadataBuilder:
         
         Args:
             tree_attn_bias: 2D bias matrix with 0/-inf, shape [tree_len, tree_len].
-            dtype: Data type for the mask (default: float16).
+            dtype: Data type for the mask (default: bool for NPU compatibility).
             
         Returns:
-            4D attention mask with -inf for masked positions, shape [1, 1, tree_len, tree_len].
+            4D attention mask with False for visible positions and True for masked positions,
+            shape [1, 1, tree_len, tree_len].
         """
         if tree_attn_bias is None:
             return None
             
         tree_len = tree_attn_bias.shape[0]
         
-        # Convert 2D bias to 4D mask (BNSD layout)
-        # EAGLE approach: set masked positions to -inf (softmax -> 0)
-        mask_value = float("-inf") if dtype == torch.float16 else 1.0
-        
         # Create 4D mask: [1, 1, tree_len, tree_len]
+        # NPU requires bool, int8, or uint8 for attention mask
+        # True = masked (will be ignored), False = visible (will be attended to)
         tree_attn_mask_4d = torch.zeros(
-            (1, 1, tree_len, tree_len), dtype=dtype, device=tree_attn_bias.device
+            (1, 1, tree_len, tree_len), dtype=torch.bool, device=tree_attn_bias.device
         )
         
-        # Apply tree mask: masked positions -> -inf
+        # Apply tree mask: masked positions -> True
         # tree_attn_bias: 0=visible, -inf=masked
         masked_positions = torch.isinf(tree_attn_bias)
-        tree_attn_mask_4d[:, :, masked_positions] = mask_value
+        tree_attn_mask_4d[:, :, masked_positions] = True
         
         return tree_attn_mask_4d
