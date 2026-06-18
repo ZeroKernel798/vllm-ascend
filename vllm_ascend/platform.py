@@ -140,6 +140,7 @@ class NPUPlatform(Platform):
         COMPRESSED_TENSORS_METHOD,
         FP8_METHOD,
         "deepseek_v4_fp8",
+        "torchao",
     ]
 
     def is_sleep_mode_available(self) -> bool:
