@@ -86,20 +86,20 @@ def test_tree_attention_full_flow():
         print(f"   Tree attention bias shape: {tree_attn_bias.shape}")
         print(f"   Tree attention bias (CPU):\n{tree_attn_bias.cpu().numpy()}\n")
         
-        # 5. 测试 2D bias 转 4D mask
-        print("5. 测试 2D bias -> 4D mask 转换...")
+        # 5. 测试 2D bias 转 2D mask
+        print("5. 测试 2D bias -> 2D mask 转换...")
         try:
-            # 注意：_convert_bias_to_4d_mask 只接受 tree_attn_bias 和 dtype 参数
-            mask_4d = builder._convert_bias_to_4d_mask(
+            # 注意：_convert_bias_to_2d_mask 只接受 tree_attn_bias 和 dtype 参数
+            mask_2d = builder._convert_bias_to_2d_mask(
                 tree_attn_bias=tree_attn_bias,
-                dtype=dtype
+                dtype=torch.int8
             )
-            print(f"   ✓ 4D mask shape: {mask_4d.shape}")
-            print(f"   4D mask dtype: {mask_4d.dtype}")
-            
+            print(f"   ✓ 2D mask shape: {mask_2d.shape}")
+            print(f"   2D mask dtype: {mask_2d.dtype}")
+
             # 验证 mask 内容
-            mask_cpu = mask_4d[0, 0].cpu().numpy()
-            print(f"   4D mask sample (position [0,0]):\n{mask_cpu}\n")
+            mask_cpu = mask_2d.cpu().numpy()
+            print(f"   2D mask sample:\n{mask_cpu}\n")
         except Exception as e:
             print(f"   ✗ 转换失败: {e}\n")
             import traceback
@@ -125,39 +125,39 @@ def test_tree_attention_full_flow():
         print(f"   Key shape (TND): {key.shape}")
         print(f"   Value shape (TND): {value.shape}\n")
         
-        # 7. 转换到 BNSD layout
-        print("7. 转换到 BNSD layout...")
-        query_bnsd = query.view(total_tokens, num_heads, head_size).permute(1, 0, 2).unsqueeze(0)
-        key_bnsd = key.view(total_tokens, num_heads, head_size).permute(1, 0, 2).unsqueeze(0)
-        value_bnsd = value.view(total_tokens, num_heads, head_size).permute(1, 0, 2).unsqueeze(0)
-        print(f"   Query BNSD shape: {query_bnsd.shape}")
-        print(f"   Key BNSD shape: {key_bnsd.shape}")
-        print(f"   Value BNSD shape: {value_bnsd.shape}\n")
-        
+        # 7. 转换到 ND layout
+        print("7. 转换到 ND layout...")
+        query_nd = query.view(total_tokens, num_heads, head_size)
+        key_nd = key.view(total_tokens, num_heads, head_size)
+        value_nd = value.view(total_tokens, num_heads, head_size)
+        print(f"   Query ND shape: {query_nd.shape}")
+        print(f"   Key ND shape: {key_nd.shape}")
+        print(f"   Value ND shape: {value_nd.shape}\n")
+
         # 8. 执行 NPU attention 计算
         print("8. 执行 NPU attention 计算...")
         output = torch.randn(
-            (1, num_heads, total_tokens, head_size),
+            (total_tokens, num_heads, head_size),
             dtype=dtype, device="npu"
         )
         softmax_lse = torch.empty(
             (1, num_heads, total_tokens), dtype=dtype, device="npu"
         )
-        
+
         try:
             torch_npu.npu_fused_infer_attention_score.out(
-                query=query_bnsd,
-                key=key_bnsd,
-                value=value_bnsd,
-                atten_mask=mask_4d,
+                query=query_nd,
+                key=key_nd,
+                value=value_nd,
+                atten_mask=mask_2d,
                 block_table=None,
-                input_layout="BNSD",
+                input_layout="ND",
                 block_size=0,
                 actual_seq_lengths=[total_tokens],
                 actual_seq_lengths_kv=[total_tokens],
                 num_key_value_heads=num_heads,
                 num_heads=num_heads,
-                scale=1.0 / (head_size ** 0.5),
+                softmax_scale=1.0 / (head_size ** 0.5),
                 sparse_mode=0,
                 pre_tokens=65535,
                 next_tokens=65535,
@@ -168,10 +168,10 @@ def test_tree_attention_full_flow():
         except Exception as e:
             print(f"   ✗ NPU attention 计算失败: {e}\n")
             return False
-        
+
         # 9. 转换输出回 TND layout
         print("9. 转换输出回 TND layout...")
-        output_tnd = output.squeeze(0).permute(1, 0, 2).contiguous().view(total_tokens, num_heads * head_size)
+        output_tnd = output.contiguous().view(total_tokens, num_heads * head_size)
         print(f"   Output TND shape: {output_tnd.shape}\n")
         
         # 10. 验证输出合理性
@@ -218,7 +218,7 @@ def test_tree_attention_with_actual_metadata():
                 self.num_draft_tokens = 4
                 self.total_tokens = 5
                 self.use_tree_attention = True
-                self.tree_attn_mask_4d = None
+                self.tree_attn_mask = None
                 self.tree_context_len = 1
         
         metadata = MockAscendMetadata()
@@ -244,17 +244,17 @@ def test_tree_attention_with_actual_metadata():
         # 创建模拟的 tree attention bias (2D)
         tree_attn_bias = torch.zeros(seq_len, seq_len, dtype=torch.float32, device="npu")
         
-        # 转换到 4D mask
-        mask_4d = builder._convert_bias_to_4d_mask(
+        # 转换到 2D mask (ND layout)
+        mask_2d = builder._convert_bias_to_2d_mask(
             tree_attn_bias=tree_attn_bias,
-            dtype=torch.float16
+            dtype=torch.int8
         )
         
         # 更新 metadata
-        metadata.tree_attn_mask_4d = mask_4d
+        metadata.tree_attn_mask = mask_2d
         
         print(f"   ✓ Metadata 更新成功")
-        print(f"   tree_attn_mask_4d shape: {metadata.tree_attn_mask_4d.shape}\n")
+        print(f"   tree_attn_mask shape: {metadata.tree_attn_mask.shape}\n")
         
         print("=== Metadata 测试通过! ===\n")
         return True

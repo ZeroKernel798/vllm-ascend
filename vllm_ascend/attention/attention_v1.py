@@ -210,8 +210,8 @@ class AscendMetadata:
     kvcomp_metadata: KVCompMetaData | None = None
     
     # ********************** Tree Attention Properties ********************* #
-    # Tree attention mask (4D, BNSD layout) for branching speculative decoding
-    tree_attn_mask_4d: torch.Tensor | None = None
+    # Tree attention mask (2D, ND layout) for branching speculative decoding
+    tree_attn_mask: torch.Tensor | None = None
     # Whether to use tree attention (branching speculative decoding)
     use_tree_attention: bool = False
     # Context length for tree attention verify stage
@@ -319,10 +319,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         # ********************** Tree Attention Support ********************* #
-        tree_attn_mask_4d = None
+        tree_attn_mask = None
         use_tree_attention = False
         tree_context_len = 0
-        
+
         # Check if tree attention is enabled (branching speculative decoding)
         if self.speculative_config and hasattr(self.speculative_config, 'speculative_token_tree'):
             from vllm_ascend.speculative_token_tree import (
@@ -330,10 +330,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 is_linear_speculative_token_tree,
             )
             from vllm_ascend.attention.tree_attention_v1 import AscendTreeAttentionMetadataBuilder
-            
+
             # Check if experimental tree attention is enabled
             experimental_enabled = is_ascend_experimental_tree_attention_enabled(self.vllm_config)
-            
+
             if experimental_enabled:
                 tree = self.speculative_config.speculative_token_tree
                 # Only enable tree attention for branching trees (not linear chain)
@@ -341,16 +341,16 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                     # Build tree attention metadata
                     tree_builder = AscendTreeAttentionMetadataBuilder(self.vllm_config)
                     tree_metadata = tree_builder.build(seq_lens.tolist())
-                    
+
                     if tree_metadata is not None and tree_metadata.tree_attn_mask is not None:
-                        # Use 4D tree attention mask (BNSD layout)
-                        tree_attn_mask_4d = tree_metadata.tree_attn_mask
+                        # Use 2D tree attention mask (ND layout)
+                        tree_attn_mask = tree_metadata.tree_attn_mask
                         use_tree_attention = True
                         tree_context_len = tree_metadata.tree_context_len
-                        
+
                         # For tree attention, we need to modify attn_mask to include tree structure
-                        # Reference: EAGLE implementation - fuse tree mask into 4D attention mask
-                        # The tree_attn_mask_4d is already in BNSD layout [1, 1, tree_len, tree_len]
+                        # NPU kernel expects 2D mask (ND layout), not 4D (BNSD layout)
+                        # The tree_attn_mask is already in ND layout [tree_len, tree_len]
                         # We'll use this mask in the attention computation
 
         attn_metadata = AscendMetadata(
@@ -372,7 +372,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             model_runner_type=self.model_config.runner_type,
             kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
             # Tree attention fields
-            tree_attn_mask_4d=tree_attn_mask_4d,
+            tree_attn_mask=tree_attn_mask,
             use_tree_attention=use_tree_attention,
             tree_context_len=tree_context_len,
         )
@@ -771,27 +771,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # ********************** Tree Attention Support ********************* #
         # Check if tree attention is enabled (branching speculative decoding)
         if getattr(attn_metadata, 'use_tree_attention', False):
-            # Use BNSD layout for tree attention (reference: EAGLE implementation)
-            input_layout = "BNSD"
-            # Use 4D tree attention mask (already in BNSD layout)
-            attn_mask = attn_metadata.tree_attn_mask_4d
-            # For tree attention, we provide full 4D mask, so sparse_mode=0
+            # Use ND layout for tree attention (NPU kernel expects 2D mask in ND layout)
+            input_layout = "ND"
+            # Use 2D tree attention mask (already in ND layout: [tree_len, tree_len])
+            attn_mask = attn_metadata.tree_attn_mask
+            # For tree attention, we provide full 2D mask, so sparse_mode=0
             sparse_mode = 0
             pre_tokens = SWA_INT_MAX
             next_tokens = SWA_INT_MAX
-            
+
             # For tree attention, we DON'T use KV cache
             # Instead, we use the key and value directly (all tokens' KV)
             # key/value shape: [num_tokens, num_kv_heads * head_size] (TND layout)
-            # Reshape to BNSD layout: [1, num_kv_heads, num_tokens, head_size]
+            # For ND layout, we need: [seq_len, num_heads, head_size] (without batch dim)
             seq_len = num_tokens
-            key = key.view(seq_len, self.num_kv_heads, self.head_size).unsqueeze(0)
-            value = value.view(seq_len, self.num_kv_heads, self.head_size).unsqueeze(0)
-            
-            # Reshape query for BNSD layout: [num_tokens, num_heads, head_size] -> [1, num_heads, seq_len, head_size]
-            query = query.view(seq_len, self.num_heads, self.head_size).unsqueeze(0)
-            output = output.view(seq_len, self.num_heads, self.head_size).unsqueeze(0)
-            
+            key = key.view(seq_len, self.num_kv_heads, self.head_size)
+            value = value.view(seq_len, self.num_kv_heads, self.head_size)
+
+            # Reshape query for ND layout: [num_tokens, num_heads, head_size]
+            query = query.view(seq_len, self.num_heads, self.head_size)
+            output = output.view(seq_len, self.num_heads, self.head_size)
+
             # Tree attention uses non-paged attention (no block table)
             block_table = None
             block_size = 0
