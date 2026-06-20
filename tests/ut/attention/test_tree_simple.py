@@ -1,4 +1,4 @@
-"""Simple test for tree attention 4D mask conversion."""
+"""Simple test for tree attention 2D mask conversion."""
 
 import torch
 from vllm_ascend.attention.tree_attention_v1 import (
@@ -16,9 +16,9 @@ class MockVllmConfig:
         self.speculative_config = MockSpeculativeConfig()
 
 
-def test_convert_bias_to_4d_mask():
-    """Test converting 2D bias to 4D mask."""
-    print("Test: Converting 2D bias to 4D mask...")
+def test_convert_bias_to_2d_mask():
+    """Test converting 2D bias to 2D mask."""
+    print("Test: Converting 2D bias to 2D mask...")
 
     # Create builder
     mock_config = MockVllmConfig()
@@ -34,18 +34,18 @@ def test_convert_bias_to_4d_mask():
 
     print(f"  Input shape: {tree_attn_bias.shape}")
 
-    # Convert to 4D mask
-    mask_4d = builder._convert_bias_to_4d_mask(
-        tree_attn_bias, dtype=torch.float16
+    # Convert to 2D mask
+    mask_2d = builder._convert_bias_to_2d_mask(
+        tree_attn_bias, dtype=torch.int8
     )
 
-    print(f"  Output shape: {mask_4d.shape}")
+    print(f"  Output shape: {mask_2d.shape}")
 
     # Check shape
-    expected_shape = (1, 1, num_tokens, num_tokens)
+    expected_shape = (num_tokens, num_tokens)
     assert (
-        mask_4d.shape == expected_shape
-    ), f"Shape mismatch: expected {expected_shape}, got {mask_4d.shape}"
+        mask_2d.shape == expected_shape
+    ), f"Shape mismatch: expected {expected_shape}, got {mask_2d.shape}"
     print("  Shape correct!")
 
     # Verify values
@@ -54,15 +54,15 @@ def test_convert_bias_to_4d_mask():
         for j in range(num_tokens):
             if j <= i:
                 # Should be 0 (visible)
-                assert mask_4d[0, 0, i, j] == 0.0, (
-                    f"Expected 0.0 at ({i}, {j}), "
-                    f"got {mask_4d[0, 0, i, j]}"
+                assert mask_2d[i, j] == 0, (
+                    f"Expected 0 at ({i}, {j}), "
+                    f"got {mask_2d[i, j]}"
                 )
             else:
-                # Should be -inf (masked)
-                assert torch.isinf(mask_4d[0, 0, i, j]), (
-                    f"Expected -inf at ({i}, {j}), "
-                    f"got {mask_4d[0, 0, i, j]}"
+                # Should be 1 (masked)
+                assert mask_2d[i, j] == 1, (
+                    f"Expected 1 at ({i}, {j}), "
+                    f"got {mask_2d[i, j]}"
                 )
     print("  Values correct!")
 
@@ -70,5 +70,5 @@ def test_convert_bias_to_4d_mask():
 
 
 if __name__ == "__main__":
-    test_convert_bias_to_4d_mask()
+    test_convert_bias_to_2d_mask()
     print("All tests passed!")
