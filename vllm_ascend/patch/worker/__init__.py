@@ -36,8 +36,12 @@ if HAS_TRITON:
 
 import vllm_ascend.patch.worker.patch_weight_utils  # noqa
 import vllm_ascend.patch.worker.patch_distributed  # noqa
-import vllm_ascend.patch.worker.patch_minimax_m2  # noqa
-import vllm_ascend.patch.worker.patch_minimax_m2_linear_attn  # noqa
+# patch_minimax_m2 may fail if vllm does not have minimax_rms_norm module
+try:
+    import vllm_ascend.patch.worker.patch_minimax_m2  # noqa
+    import vllm_ascend.patch.worker.patch_minimax_m2_linear_attn  # noqa
+except ImportError:
+    pass
 import vllm_ascend.patch.worker.patch_mamba_utils  # noqa
 import vllm_ascend.patch.worker.patch_qwen3_next_mtp  # noqa
 

@@ -317,16 +317,10 @@ def prepare_speculative_token_tree_attn_bias(
         attn_bias[draft_idx, draft_idx] = 0
         
         # Token can see its ancestors
-        # Ancestors are indexed by their position in tree_choices (0-based)
-        # Root is 0, draft tokens are 1, 2, ...
+        # chain[i] is the bias index of the i-th ancestor.
+        # 0 = root (bias index 0), j > 0 = j-th entity (bias index j).
         for ancestor in chain:
-            # ancestor is the index in tree_choices
-            # If ancestor is 0, it means root -> bias index 0
-            # If ancestor is i > 0, it means the i-th draft token -> bias index i+1
-            if ancestor == 0:
-                attn_bias[draft_idx, 0] = 0
-            else:
-                attn_bias[draft_idx, ancestor + 1] = 0
+            attn_bias[draft_idx, ancestor] = 0
     
     return attn_bias
 

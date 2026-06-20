@@ -181,7 +181,7 @@ class AscendTreeAttentionMetadataBuilder:
     def _convert_bias_to_4d_mask(
         self,
         tree_attn_bias: torch.Tensor,
-        dtype: torch.dtype = torch.bool,
+        dtype: torch.dtype = torch.int8,
     ) -> torch.Tensor:
         """Convert attention bias to 4D attention mask (BNSD layout).
         
@@ -190,10 +190,10 @@ class AscendTreeAttentionMetadataBuilder:
         
         Args:
             tree_attn_bias: 2D bias matrix with 0/-inf, shape [tree_len, tree_len].
-            dtype: Data type for the mask (default: bool for NPU compatibility).
+            dtype: Data type for the mask (default: int8 for NPU compatibility).
             
         Returns:
-            4D attention mask with False for visible positions and True for masked positions,
+            4D attention mask with 0 for visible positions and 1 for masked positions,
             shape [1, 1, tree_len, tree_len].
         """
         if tree_attn_bias is None:
@@ -202,15 +202,15 @@ class AscendTreeAttentionMetadataBuilder:
         tree_len = tree_attn_bias.shape[0]
         
         # Create 4D mask: [1, 1, tree_len, tree_len]
-        # NPU requires bool, int8, or uint8 for attention mask
-        # True = masked (will be ignored), False = visible (will be attended to)
+        # NPU expects int8 mask: 0 = visible, 1 = masked
+        # (bool dtype may not be supported by the kernel)
         tree_attn_mask_4d = torch.zeros(
-            (1, 1, tree_len, tree_len), dtype=torch.bool, device=tree_attn_bias.device
+            (1, 1, tree_len, tree_len), dtype=torch.int8, device=tree_attn_bias.device
         )
         
-        # Apply tree mask: masked positions -> True
+        # Apply tree mask: masked positions -> 1
         # tree_attn_bias: 0=visible, -inf=masked
         masked_positions = torch.isinf(tree_attn_bias)
-        tree_attn_mask_4d[:, :, masked_positions] = True
+        tree_attn_mask_4d[:, :, masked_positions] = 1
         
         return tree_attn_mask_4d
