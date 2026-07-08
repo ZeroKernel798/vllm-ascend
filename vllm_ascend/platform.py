@@ -143,6 +143,7 @@ class NPUPlatform(Platform):
         "torchao",
     ]
 
+
     def is_sleep_mode_available(self) -> bool:
         return True
 
@@ -189,7 +190,7 @@ class NPUPlatform(Platform):
         # For online serving, "ascend" quantization method is not a choice natively,
         # so we need to add "ascend" quantization method to quantization methods list
         # and the user can enable quantization using "vllm serve --quantization ascend".
-        if parser is not None:
+        if parser is not None and hasattr(parser, "_option_string_actions"):
             quant_action = parser._option_string_actions.get("--quantization")
             if quant_action and hasattr(quant_action, "choices") and quant_action.choices:
                 if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:

@@ -37,7 +37,13 @@ def _ensure_global_patch():
 
 def register():
     """Register the NPU platform."""
-
+    # NOTE: Do NOT call register_quantization() here.
+    # This entry point is called during vLLM platform discovery and must be
+    # side-effect-free.  ``register_quantization()`` drags in torchao and
+    # upstream quantization modules, whose import chain can interfere with
+    # platform resolution in the EngineCore subprocess (multiprocessing.spawn).
+    # Quantization registration is deferred to ``register_service_profiling``
+    # which runs as a general plugin after the platform is guaranteed active.
     return "vllm_ascend.platform.NPUPlatform"
 
 
@@ -68,11 +74,33 @@ def register_service_profiling():
 
     generate_service_profiling_config()
 
+    # Deferred TorchAO config override (moved from register() to avoid
+    # heavyweight imports during platform discovery — see register()).
+    register_quantization()
+
 
 def register_model():
+    register_quantization()
+
     from .models import register_model
 
     register_model()
 
 
 import vllm_ascend.logger  # noqa: E402, F401
+
+def register_quantization():
+    """Re-register Ascend-specific quantization configs to override upstream.
+
+    This must run AFTER all upstream quantization configs are registered,
+    otherwise the upstream registration would overwrite ours.
+    """
+    from .quantization.torchao_config import AscendTorchAOConfig
+    from vllm.model_executor.layers.quantization import (
+        register_quantization_config,
+    )
+
+    # Re-register to override upstream TorchAOConfig.
+    # register_quantization_config internally writes to
+    # _CUSTOMIZED_METHOD_TO_QUANT_CONFIG — no manual dict write needed.
+    register_quantization_config("torchao")(AscendTorchAOConfig)

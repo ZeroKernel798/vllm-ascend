@@ -110,6 +110,26 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # -- torchao quantization flags ------------------------------------------
+    # When True (the default), allow ``--quantization torchao`` to dequantize a
+    # layer's weight to a plain tensor and retry on ``F.linear`` failures.
+    "VLLM_ASCEND_TORCHAO_ALLOW_DEQUANT_FALLBACK": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_TORCHAO_ALLOW_DEQUANT_FALLBACK", "1"))
+    ),
+    # Override the default torchao config (normally Int8WeightOnlyConfig).
+    # Accepted values: "int8wo" (default), "w4a8" (int8 act + int4 weight),
+    # "w8a8" (int8 act + int8 weight), "int4wo" (int4 weight only).
+    "VLLM_ASCEND_TORCHAO_CONFIG_TYPE": lambda: os.getenv(
+        "VLLM_ASCEND_TORCHAO_CONFIG_TYPE", "int8wo"
+    ),
+    # When True (the default), route int8 weight-only torchao layers through
+    # the native ``npu_weight_quant_batchmatmul`` kernel instead of
+    # ``F.linear`` over a dequantized weight. This fuses antiquant into the
+    # GEMM (no separate dequant pass). Set to 0 to fall back to the plain
+    # F.linear + dequant path (useful for accuracy A/B comparison).
+    "VLLM_ASCEND_TORCHAO_NATIVE_KERNEL": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_TORCHAO_NATIVE_KERNEL", "1"))
+    ),
 }
 
 # end-env-vars-definition

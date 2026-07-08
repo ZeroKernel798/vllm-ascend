@@ -465,6 +465,7 @@ class NPUWorker(WorkerBase):
             setup_ascend_local_comm_res(self.local_rank, self.vllm_config.kv_transfer_config)
 
         # take current memory snapshot
+        # take current memory snapshot
         if vllm_version_is("0.23.0"):
             self.init_snapshot = MemorySnapshot()
         else:
@@ -498,8 +499,15 @@ class NPUWorker(WorkerBase):
 
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
-        # Set random seed.
-        set_random_seed(self.model_config.seed)
+        # Set random seed.  Use torch_npu directly to avoid
+        # ``current_platform.manual_seed_all`` falling back to the upstream
+        # NotImplementedError when the ascend platform plugin is not yet
+        # activated in the EngineCore subprocess.
+        try:
+            set_random_seed(self.model_config.seed)
+        except NotImplementedError:
+            import torch_npu  # noqa: F401
+            torch.npu.manual_seed_all(self.model_config.seed)
         # Initialize device properties used by triton kernels.
         init_device_properties_triton()
 
