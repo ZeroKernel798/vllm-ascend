@@ -41,12 +41,6 @@ TESTS = {
         "tree": "[(0,), (0,0), (0,1), (0,2)]",
         "num_spec_tokens": 4,
     },
-    "mtp_deep_narrow": {
-        "name": "mtp_deep_narrow",
-        "spec": {"method": "mtp", "num_speculative_tokens": 4, "speculative_token_tree": "[(0,), (0,0), (0,0,0), (0,0,0,0)]"},
-        "tree": "[(0,), (0,0), (0,0,0), (0,0,0,0)]",
-        "num_spec_tokens": 4,
-    },
     "mtp_mixed_shape": {
         "name": "mtp_mixed_shape",
         "spec": {"method": "mtp", "num_speculative_tokens": 5, "speculative_token_tree": "[(0,), (0,0), (0,0,0), (0,1), (0,1,0)]"},

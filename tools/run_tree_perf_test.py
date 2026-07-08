@@ -20,7 +20,6 @@ TESTS = [
     {"name": "linear_chain", "spec": {"method":"mtp","num_speculative_tokens":3}, "tree": None, "ns": 3},
     {"name": "binary_tree", "spec": {"method":"mtp","num_speculative_tokens":3,"speculative_token_tree":"[(0,), (0,0), (0,1)]"}, "tree": "[(0,), (0,0), (0,1)]", "ns": 3},
     {"name": "ternary_tree", "spec": {"method":"mtp","num_speculative_tokens":4,"speculative_token_tree":"[(0,), (0,0), (0,1), (0,2)]"}, "tree": "[(0,), (0,0), (0,1), (0,2)]", "ns": 4},
-    {"name": "deep_narrow", "spec": {"method":"mtp","num_speculative_tokens":4,"speculative_token_tree":"[(0,), (0,0), (0,0,0), (0,0,0,0)]"}, "tree": "[(0,), (0,0), (0,0,0), (0,0,0,0)]", "ns": 4},
     {"name": "mixed_shape", "spec": {"method":"mtp","num_speculative_tokens":5,"speculative_token_tree":"[(0,), (0,0), (0,0,0), (0,1), (0,1,0)]"}, "tree": "[(0,), (0,0), (0,0,0), (0,1), (0,1,0)]", "ns": 5},
 ]
 

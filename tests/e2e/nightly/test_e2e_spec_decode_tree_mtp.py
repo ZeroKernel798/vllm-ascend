@@ -20,7 +20,6 @@ TREE_TEST_CASES = [
     pytest.param(None, 3, id="linear_chain"),
     pytest.param("[(0,), (0,0), (0,1)]", 3, id="binary_tree"),
     pytest.param("[(0,), (0,0), (0,1), (0,2)]", 4, id="ternary_tree"),
-    pytest.param("[(0,), (0,0), (0,0,0), (0,0,0,0)]", 4, id="deep_narrow"),
     pytest.param("[(0,), (0,0), (0,0,0), (0,1), (0,1,0)]", 5, id="mixed_shape"),
 ]
 

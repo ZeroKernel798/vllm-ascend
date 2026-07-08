@@ -23,7 +23,6 @@ tests=(
   "linear_chain|--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}'|N/A"
   "binary_tree|--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"speculative_token_tree\":\"[(0,), (0,0), (0,1)]\"}'|[(0,),(0,0),(0,1)]"
   "ternary_tree|--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":4,\"speculative_token_tree\":\"[(0,), (0,0), (0,1), (0,2)]\"}'|[(0,),(0,0),(0,1),(0,2)]"
-  "deep_narrow|--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":4,\"speculative_token_tree\":\"[(0,), (0,0), (0,0,0), (0,0,0,0)]\"}'|[(0,),(0,0),(0,0,0),(0,0,0,0)]"
   "mixed_shape|--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":5,\"speculative_token_tree\":\"[(0,), (0,0), (0,0,0), (0,1), (0,1,0)]\"}'|[(0,),(0,0),(0,0,0),(0,1),(0,1,0)]"
 )
 

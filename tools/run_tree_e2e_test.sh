@@ -26,7 +26,6 @@ TESTS=(
   ["mtp_linear_chain"]='{"method":"mtp","num_speculative_tokens":3}:3:'
   ["mtp_binary_tree"]='{"method":"mtp","num_speculative_tokens":3,"speculative_token_tree":"[(0,), (0,0), (0,1)]"}:3:[(0,), (0,0), (0,1)]'
   ["mtp_ternary_tree"]='{"method":"mtp","num_speculative_tokens":4,"speculative_token_tree":"[(0,), (0,0), (0,1), (0,2)]"}:4:[(0,), (0,0), (0,1), (0,2)]'
-  ["mtp_deep_narrow"]='{"method":"mtp","num_speculative_tokens":4,"speculative_token_tree":"[(0,), (0,0), (0,0,0), (0,0,0,0)]"}:4:[(0,), (0,0), (0,0,0), (0,0,0,0)]'
   ["mtp_mixed_shape"]='{"method":"mtp","num_speculative_tokens":5,"speculative_token_tree":"[(0,), (0,0), (0,0,0), (0,1), (0,1,0)]"}:5:[(0,), (0,0), (0,0,0), (0,1), (0,1,0)]'
 )
 

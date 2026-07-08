@@ -613,8 +613,7 @@ def tree_attention_split_kv_kernel(
             pa_offs = (
                 head_group * pa_stride_hg
                 + seq_group * pa_stride_sg
-                + h_local * num_tokens * pa_stride_d  # FIX: interleave
-                + q_write_offs[:, None] * pa_stride_d
+                + (h_local * num_tokens + q_write_offs[:, None]) * pa_stride_t
                 + d_offs[None, :]
             )
             tl.store(partial_acc_ptr + pa_offs, acc_m,
@@ -703,8 +702,7 @@ def tree_attention_reduce_kernel(
         pa_off = (
             head_group * pa_stride_hg
             + sg * pa_stride_sg
-            + h_local * num_tokens * pa_stride_d  # FIX: interleave
-            + q_idx * pa_stride_d
+            + (h_local * num_tokens + q_idx) * pa_stride_t
         )
         acc_s = tl.load(partial_acc_ptr + pa_off + d_offs, mask=d_mask, other=0.0)
 
