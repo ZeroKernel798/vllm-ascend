@@ -500,6 +500,21 @@ def maybe_save_kv_layer_to_connector(
 
 
 def round_up(val: int, align: int) -> int:
+    """Round ``val`` up to the nearest multiple of ``align``.
+
+    Examples
+    --------
+    >>> round_up(0, 16)
+    0
+    >>> round_up(1, 16)
+    16
+    >>> round_up(16, 16)
+    16
+    >>> round_up(17, 16)
+    32
+    >>> round_up(42, 0)
+    0
+    """
     if align == 0:
         return 0
     return -(val // -align) * align

@@ -20,6 +20,7 @@ from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.spec_decode.speculative_token_tree import get_speculative_tree_len
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_dsa_cp_with_o_proj_tp,
@@ -222,7 +223,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.local_seq_lens = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
 
         self.speculative_config = vllm_config.speculative_config
-        self.decode_threshold = 1
+        self.decode_threshold = get_speculative_tree_len(self.speculative_config)
         self.spec_slot_mapping = None
         if get_ascend_device_type() in {AscendDeviceType.A5}:
             self.slot_mapping_shape = (vllm_config.scheduler_config.max_num_batched_tokens,)  # type: ignore
@@ -242,7 +243,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
                 for _ in range(spec_token_num)
             ]
-            self.decode_threshold += spec_token_num
             assert self.decode_threshold <= 16, (
                 f"decode_threshold exceeded \
                 npu_fused_infer_attention_score TND layout's limit of 16, \

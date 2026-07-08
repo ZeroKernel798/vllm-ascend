@@ -1,18 +1,39 @@
 from typing import TYPE_CHECKING, Any
 
 from vllm.config.speculative import SpeculativeConfig
-from vllm.utils.import_utils import LazyLoader
 
 if TYPE_CHECKING:
-    import vllm.model_executor.layers.quantization as me_quant
     from transformers import PretrainedConfig
 else:
     PretrainedConfig = Any
 
-    me_quant = LazyLoader("model_executor", globals(), "vllm.model_executor.layers.quantization")
-
 
 def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+    """Rewrite a HuggingFace ``PretrainedConfig`` for speculative (MTP/Eagle) use.
+
+    Maps model architectures to their multi-token-prediction (MTP) equivalents,
+    injecting ``n_predict``, ``architectures``, and other required fields.
+    Returns the mutated config (same object).
+
+    Examples
+    --------
+    >>> from unittest.mock import MagicMock
+    >>> cfg = MagicMock()
+    >>> cfg.architectures = ["DeepseekV3ForCausalLM"]
+    >>> cfg.model_type = "deepseek_v3"
+    >>> result = hf_config_override(cfg)
+    >>> result.model_type
+    'deepseek_mtp'
+
+    >>> cfg = MagicMock()
+    >>> cfg.architectures = ["UnknownModel"]
+    >>> cfg.model_type = "unknown"
+    >>> result = hf_config_override(cfg)
+    >>> result is cfg
+    True
+    >>> result.model_type
+    'unknown'
+    """
     initial_architecture = hf_config.architectures[0]
     if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "deepseek_v4", "glm_moe_dsa"):
         target_model_type = hf_config.model_type

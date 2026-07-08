@@ -32,6 +32,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.utils import is_pd_decode_recompute_scheduler_enabled
+from vllm_ascend.spec_decode.speculative_token_tree import get_speculative_tree_len
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
@@ -71,7 +72,7 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_world_rank = dcp_rank
         self.speculative_config = vllm_config.speculative_config
-        self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+        self.decode_threshold = get_speculative_tree_len(self.speculative_config)
         self.vllm_config = vllm_config
         self.pd_decode_recompute_scheduler_enabled = is_pd_decode_recompute_scheduler_enabled(vllm_config)
         self.max_num_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens

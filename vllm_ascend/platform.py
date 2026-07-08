@@ -188,11 +188,14 @@ class NPUPlatform(Platform):
         # For online serving, "ascend" quantization method is not a choice natively,
         # so we need to add "ascend" quantization method to quantization methods list
         # and the user can enable quantization using "vllm serve --quantization ascend".
-        if parser is not None:
-            quant_action = parser._option_string_actions.get("--quantization")
-            if quant_action and hasattr(quant_action, "choices") and quant_action.choices:
-                if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
-                    quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
+        try:
+            if parser is not None and hasattr(parser, "_option_string_actions"):
+                quant_action = parser._option_string_actions.get("--quantization")
+                if quant_action and hasattr(quant_action, "choices") and quant_action.choices:
+                    if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
+                        quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
+        except AttributeError:
+            pass
 
         if not is_310p():
             from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendFp8Config, AscendModelSlimConfig  # noqa: F401
@@ -231,10 +234,9 @@ class NPUPlatform(Platform):
         if max_num_seqs is None:
             return None
 
-        decode_query_len = 1
         speculative_config = getattr(vllm_config, "speculative_config", None)
-        if speculative_config and speculative_config.num_speculative_tokens:
-            decode_query_len += speculative_config.num_speculative_tokens
+        from vllm_ascend.spec_decode.speculative_token_tree import get_speculative_tree_len
+        decode_query_len = get_speculative_tree_len(speculative_config)
 
         return min(max_num_seqs * decode_query_len, 512)
 

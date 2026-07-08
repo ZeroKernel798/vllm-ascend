@@ -127,6 +127,7 @@ from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
+from vllm_ascend.spec_decode.speculative_token_tree import get_speculative_tree_len
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
@@ -496,7 +497,7 @@ class NPUModelRunner(GPUModelRunner):
         # Compute potential_max_tokens once here; it is reused by the skip-allreduce
         # decision and the o_proj static-exchange buffer sizing (see get_potential_max_tokens).
         set_potential_max_tokens(vllm_config)
-        self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+        self.decode_threshold = get_speculative_tree_len(self.speculative_config)
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -627,7 +628,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             assert spec_token_num > 0
-            self.decode_token_per_req = 1 + spec_token_num
+            self.decode_token_per_req = get_speculative_tree_len(self.speculative_config)
             if get_pp_group().is_last_rank:
                 self.drafter = self._get_drafter()
                 if self.speculative_config.method == "eagle3":

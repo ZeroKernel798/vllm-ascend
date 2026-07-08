@@ -36,6 +36,7 @@ from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _validate_cu_seqlens,
     build_chunk_meta_device,
 )
+from vllm_ascend.spec_decode.speculative_token_tree import get_speculative_tree_len
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -562,9 +563,9 @@ def _allocate_spec_causal_conv1d_host_slot(
 ) -> _GDNSpecCausalConv1dHostBufferSlot:
     max_num_seqs = builder.vllm_config.scheduler_config.max_num_seqs
     spec_cfg = builder.vllm_config.speculative_config
-    num_speculative_tokens = spec_cfg.num_speculative_tokens if spec_cfg else 0
+    decode_query_len = get_speculative_tree_len(spec_cfg)
     decode_cudagraph_max_bs = getattr(builder, "decode_cudagraph_max_bs", max_num_seqs)
-    max_elements = decode_cudagraph_max_bs * (num_speculative_tokens + 1)
+    max_elements = decode_cudagraph_max_bs * decode_query_len
     return _GDNSpecCausalConv1dHostBufferSlot(
         cache_indices_cpu=torch.empty(
             max_elements,
@@ -813,7 +814,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 and hasattr(speculative_config, "method")
                 and speculative_config.method == "dflash"
             ):
-                self.reorder_batch_threshold = 1 + speculative_config.num_speculative_tokens
+                self.reorder_batch_threshold = get_speculative_tree_len(speculative_config)
 
     def _copy_sequence_indices_to_device(
         self,
@@ -1046,6 +1047,18 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
             else:
+                # Ensure spec_sequence_masks and query_lens are compatible.
+                # Speculative decode may add extra query entries (draft tokens)
+                # that are not reflected in the per-sequence spec mask.
+                if spec_sequence_masks.size(0) != query_lens.size(0):
+                    pad = query_lens.size(0) - spec_sequence_masks.size(0)
+                    if pad > 0:
+                        spec_sequence_masks = torch.cat(
+                            (
+                                spec_sequence_masks,
+                                spec_sequence_masks.new_ones(pad, dtype=torch.bool),
+                            )
+                        )
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks,
                     query_lens,

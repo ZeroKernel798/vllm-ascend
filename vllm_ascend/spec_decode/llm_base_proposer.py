@@ -54,7 +54,8 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
+from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled, vllm_version_is
+from vllm_ascend.spec_decode.speculative_token_tree import get_speculative_tree_len
 
 
 @contextmanager
@@ -166,7 +167,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.use_async_scheduling = self.vllm_config.scheduler_config.async_scheduling
         self.use_compress = hasattr(self.vllm_config.model_config.hf_config, "compress_ratios")
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
-        self.decode_threshold = 1 + self.num_speculative_tokens
+        self.decode_threshold = get_speculative_tree_len(self.speculative_config)
         self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
         self.arange_cpu = torch.arange(self.arange.shape[0], device="cpu", dtype=torch.int32)
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
@@ -603,7 +604,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 num_reqs=num_reqs,
                 num_actual_tokens=num_tokens,
                 num_input_tokens=num_tokens,
-                max_query_len=self.num_speculative_tokens + 1,
+                max_query_len=self.decode_threshold,
                 num_computed_tokens_cpu=num_computed_tokens_cpu,
                 actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
                 block_table_tensor=self.runner.input_batch.block_table[self.kv_cache_gid].get_device_tensor()[
@@ -672,7 +673,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         model_positions = self._get_positions(num_tokens)
 
-        batch_size = max(num_tokens // (self.num_speculative_tokens + 1), 1)
+        batch_size = max(num_tokens // self.decode_threshold, 1)
         # TODO: temporarily hack here, we should find out batch_size for profile_run
         if is_profile:
             batch_size = min(batch_size, self.runner.max_num_reqs)
@@ -1064,6 +1065,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "multi_steps_attn_metadata": multi_steps_attn_metadata,
                 "num_tokens": num_tokens,
                 "is_prefill": attn_metadata_i.num_prefills,
+                "common_attn_metadata": common_attn_metadata,
             }
             run_draft = partial(self._runnable, **model_inputs)
 
@@ -1100,6 +1102,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         multi_steps_attn_metadata,
         num_tokens,
         is_prefill=None,
+        common_attn_metadata=None,
     ) -> torch.Tensor:
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
@@ -1239,6 +1242,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
             return torch.stack(draft_token_ids_list, dim=1)
+
+        # Tree-based speculative drafting: for non-linear token trees,
+        # use a per-level drafting loop instead of the per-step linear loop.
+        spec_config = self.speculative_config
+        drafts_per_level = getattr(spec_config, "drafts_per_level", None)
+        is_level_based = (
+            drafts_per_level is not None
+            and any(d > 1 for d in drafts_per_level)
+        )
+        if is_level_based and self.pcp_size * self.dcp_size > 1:
+            raise RuntimeError(
+                "non-linear speculative token tree is not supported with PCP/DCP"
+            )
+
+        if is_level_based:
+            return self._draft_tree_per_level(
+                first_draft_token_ids=draft_token_ids,
+                hidden_states=hidden_states,
+                num_input_tokens=num_input_tokens,
+                token_indices_to_sample=token_indices_to_sample,
+                multi_steps_attn_metadata=multi_steps_attn_metadata,
+                common_attn_metadata=common_attn_metadata,
+            )
 
         # The logits are split and then merged only when lmhead_tp_enable() is enabled.
         # As a result, the batch size length becomes the actual length 32.
@@ -1383,6 +1409,220 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
         return draft_token_ids
+
+    def _draft_tree_per_level(
+        self,
+        first_draft_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        num_input_tokens: int,
+        token_indices_to_sample: torch.Tensor,
+        multi_steps_attn_metadata: list | None = None,
+        common_attn_metadata=None,
+    ) -> torch.Tensor:
+        """Generate draft tokens using per-level tree drafting.
+
+        For non-linear speculative token trees where drafts_per_level has
+        values > 1 (branched trees), this method expands parent tokens per
+        level using ``child_drafts_per_level``, builds per-level attention
+        metadata, masks siblings via tree attention bias, and samples one
+        token per leaf position.
+
+        Returns ``[batch_size, num_speculative_tokens]``.
+        """
+        spec_config = self.speculative_config
+        batch_size = first_draft_token_ids.shape[0]
+
+        # Collect all draft tokens: [num_speculative_tokens, batch_size]
+        draft_token_ids_tensor = torch.zeros(
+            (self.num_speculative_tokens, batch_size),
+            dtype=first_draft_token_ids.dtype,
+            device=self.device,
+        )
+        draft_token_ids_tensor[0] = first_draft_token_ids
+
+        # Current level state (level-1 tokens, one per request)
+        current_tokens = first_draft_token_ids  # [batch_size]
+        if self.uses_mrope:
+            current_positions = self.mrope_positions[:, token_indices_to_sample]
+        else:
+            current_positions = self.positions[token_indices_to_sample]
+        current_hidden_states = hidden_states[token_indices_to_sample]
+        current_hidden_states = current_hidden_states.reshape(batch_size, -1)
+
+        next_draft_idx = 1  # next free row index in draft_token_ids_tensor
+        forward_context = get_forward_context()
+
+        for level_idx in range(1, self.speculative_config.tree_depth):
+            # child_counts: per-parent, per-request — replicated batch_size times
+            per_req_counts = self.speculative_config.child_drafts_per_level[level_idx]
+            n_parents_per_req = len(per_req_counts)
+            child_counts = per_req_counts * batch_size
+
+            total_tokens = sum(child_counts)
+            if total_tokens == 0:
+                # No children at this level → skip
+                break
+
+            # Expand inputs: repeat each parent's data by its child count
+            counts = torch.tensor(child_counts, dtype=torch.long, device=self.device)
+            expanded_tokens = torch.repeat_interleave(current_tokens, counts, dim=0)
+            if self.uses_mrope:
+                expanded_positions = torch.repeat_interleave(
+                    current_positions + 1, counts, dim=1
+                )
+            else:
+                expanded_positions = torch.repeat_interleave(
+                    current_positions + 1, counts, dim=0
+                )
+
+            # Handle max_model_len clamping
+            if self.uses_mrope:
+                exceeds_max_model_len = expanded_positions[0] >= self.max_model_len
+                clamped_positions = torch.where(
+                    exceeds_max_model_len.unsqueeze(0),
+                    torch.zeros_like(expanded_positions),
+                    expanded_positions,
+                )
+            else:
+                exceeds_max_model_len = expanded_positions >= self.max_model_len
+                clamped_positions = torch.where(
+                    exceeds_max_model_len, 0, expanded_positions
+                )
+
+            # Copy to buffers
+            self.input_ids[:total_tokens] = expanded_tokens
+            self._set_positions(total_tokens, clamped_positions)
+            self.hidden_states[:total_tokens] = torch.repeat_interleave(
+                current_hidden_states, counts, dim=0
+            )
+
+            # Compute query_start_loc per request at this level
+            tokens_per_req = [
+                sum(child_counts[r * n_parents_per_req : (r + 1) * n_parents_per_req])
+                for r in range(batch_size)
+            ]
+            query_start_loc = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
+            query_start_loc[1:] = torch.tensor(
+                tokens_per_req, dtype=torch.int32, device=self.device
+            ).cumsum(0)
+
+            # Set forward context for this level
+            _EXTRA_CTX.num_tokens = total_tokens
+            _EXTRA_CTX.num_accept_tokens = total_tokens
+
+            # Reset MOE layer index
+            if forward_context is not None:
+                forward_context.moe_layer_index = 0
+
+            # Build per-level attention metadata from the original
+            # common_attn_metadata, overriding query_start_loc / seq_lens
+            # / num_reqs to match this level's batch layout.
+            if common_attn_metadata is not None:
+                import copy as _copy
+                level_cad = _copy.copy(common_attn_metadata)
+                level_cad.num_reqs = batch_size
+                level_cad.num_actual_tokens = total_tokens
+                level_cad.max_query_len = (
+                    max(child_counts) if total_tokens > 0 else 1
+                )
+                level_cad.query_start_loc = query_start_loc
+                level_cad.query_start_loc_cpu = query_start_loc.cpu().clone()
+
+                # Minimal seq_lens for decode-drafting (one entry per request)
+                level_seq = torch.tensor(
+                    tokens_per_req, dtype=torch.int32, device=self.device
+                )
+                level_cad.seq_lens = level_seq
+                if getattr(level_cad, "seq_lens_cpu", None) is not None:
+                    level_cad.seq_lens_cpu = level_seq.cpu().clone()
+                if getattr(level_cad, "_seq_lens_cpu", None) is not None:
+                    level_cad._seq_lens_cpu = level_seq.cpu().clone()
+
+                # Use the draft attn-group builder (same as
+                # attn_update_stack_num_spec_norm does internally).
+                builder = self.draft_attn_groups[0].get_metadata_builder()
+                attn_meta = builder.build(
+                    0, level_cad, self.runner.get_model()
+                )
+                per_layer = {
+                    layer_name: attn_meta
+                    for layer_name in self.attn_layer_names
+                }
+                # Attach tree bias mask for this level (sparse_mode=0 path)
+                tree_bias_slices = getattr(
+                    self.speculative_config, "tree_attn_bias_slices", None
+                )
+                if tree_bias_slices and level_idx < len(tree_bias_slices):
+                    tree_bias = tree_bias_slices[level_idx].to(self.device)
+                    for entry in per_layer.values():
+                        entry.attn_mask = tree_bias
+                        entry.is_tree_mask = True
+
+                if forward_context is not None:
+                    forward_context.attn_metadata = per_layer
+            elif multi_steps_attn_metadata and level_idx < len(multi_steps_attn_metadata):
+                # Fallback: use pre-built metadata (may not match
+                # per-level token counts).
+                if forward_context is not None:
+                    forward_context.attn_metadata = (
+                        multi_steps_attn_metadata[level_idx]
+                    )
+
+            # Build model inputs
+            model_input_ids = self.input_ids[:total_tokens]
+            model_positions = self._get_positions(total_tokens)
+
+            model_kwargs: dict[str, Any] = {
+                "input_ids": model_input_ids,
+                "positions": model_positions,
+                "inputs_embeds": None,
+            }
+            if self.pass_hidden_states_to_model:
+                model_kwargs["hidden_states"] = self.hidden_states[:total_tokens]
+
+            # Run model
+            ret_hidden_states = self.model(**model_kwargs)
+            if not self.model_returns_tuple():
+                last_hidden_states = ret_hidden_states
+            else:
+                last_hidden_states, _ = ret_hidden_states
+
+            # Sample: one token per input position
+            if get_ascend_config().enable_reduce_sample and self.method in ("eagle3",):
+                new_draft_token_ids = self.compute_draft_token_ids(last_hidden_states)
+            else:
+                logits = self.model.compute_logits(last_hidden_states)
+                new_draft_token_ids = logits.argmax(dim=-1)
+
+            # Store tokens into draft_token_ids_tensor
+            cumsum = 0
+            for req_idx in range(batch_size):
+                for par_idx in range(n_parents_per_req):
+                    n = per_req_counts[par_idx]
+                    if n == 0:
+                        continue
+                    parent_global_idx = req_idx * n_parents_per_req + par_idx
+                    n_ch = child_counts[parent_global_idx]
+                    draft_token_ids_tensor[
+                        next_draft_idx : next_draft_idx + n_ch, req_idx
+                    ] = new_draft_token_ids[cumsum : cumsum + n_ch]
+                    cumsum += n_ch
+
+            next_draft_idx += spec_config.drafts_per_level[level_idx]
+
+            # Prepare for next level
+            current_tokens = new_draft_token_ids
+            current_positions = expanded_positions
+            # Use last_hidden_states as the hidden input for the next level.
+            # Reshape so each row corresponds to one draft token position
+            current_hidden_states = last_hidden_states
+            if self.method not in ("mtp",):
+                # For eagle-style: hidden_states already per-token
+                pass
+
+        return draft_token_ids_tensor.swapaxes(0, 1)
 
     def set_inputs_first_pass(
         self,

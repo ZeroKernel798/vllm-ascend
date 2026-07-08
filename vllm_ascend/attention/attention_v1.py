@@ -76,6 +76,23 @@ _ATTN_KEYS_BUFFER = None
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
 class AscendAttentionBackend(AttentionBackend):
+    """Ascend NPU attention backend.
+
+    Registered as ``CUSTOM`` / ``ASCEND`` in the backend registry.
+
+    Class attributes
+    ----------------
+    accept_output_buffer : bool = True
+        This backend accepts pre-allocated output buffers from the engine.
+
+    Static factories
+    ----------------
+    get_name() → ``"CUSTOM"`` or ``"FLASH_ATTN"`` (V2 runner)
+    get_impl_cls() → ``AscendAttentionBackendImpl`` (or CP variant)
+    get_builder_cls() → ``AscendAttentionMetadataBuilder`` (or CP variant)
+    get_kv_cache_shape() → ``(2, num_blocks, block_size, num_kv_heads, head_size)``
+    get_supported_kernel_block_sizes() → ``[128]``
+    """
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -109,6 +126,15 @@ class AscendAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
+        """Return the KV cache tensor shape.
+
+        Always ``(2, num_blocks, block_size, num_kv_heads, head_size)``.
+
+        Examples
+        --------
+        >>> AscendAttentionBackend.get_kv_cache_shape(100, 128, 16, 128)
+        (2, 100, 128, 16, 128)
+        """
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -141,10 +167,28 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
+        """Return the KV cache block sizes supported by this backend.
+
+        Examples
+        --------
+        >>> AscendAttentionBackend.get_supported_kernel_block_sizes()
+        [128]
+        """
         return [128]
 
 
 class AscendAttentionState(Enum):
+    """Attention pipeline states for Ascend backend.
+
+    Examples
+    --------
+    >>> AscendAttentionState.DecodeOnly.value
+    2
+    >>> AscendAttentionState.SpecDecoding.name
+    'SpecDecoding'
+    >>> AscendAttentionState(0)  # PrefillNoCache
+    <AscendAttentionState.PrefillNoCache: 0>
+    """
     PrefillNoCache = 0
     PrefillCacheHit = 1
     DecodeOnly = 2
@@ -213,13 +257,44 @@ class AscendMetadata:
 
     kvcomp_metadata: KVCompMetaData | None = None
 
+    # Tree attention
+    is_tree_mask: bool = False
+    """Whether the attn_mask is a tree-structured attention bias mask
+    (as opposed to a standard causal mask). When True, the attention
+    is dispatched to the in-house Triton ``tree_unified_attention``
+    kernel, which consumes the bias directly as ``qq_bias`` (no CANN
+    fused-infer-attention fallback).
+
+    Examples
+    --------
+    >>> meta = AscendMetadata()
+    >>> meta.is_tree_mask
+    False
+
+    >>> import torch
+    >>> tree_bias = torch.tensor([[0.0, float("-inf")], [0.0, 0.0]])
+    >>> meta_tree = AscendMetadata(attn_mask=tree_bias, is_tree_mask=True)
+    >>> meta_tree.is_tree_mask
+    True
+    >>> meta_tree.attn_mask.shape
+    torch.Size([2, 2])
+    """
+
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
-    """
-    Builder for constructing AscendMetadata from CommonAttentionMetadata.
+    """Builder for constructing AscendMetadata from CommonAttentionMetadata.
 
     Handles attention mask generation and metadata preparation for
     Ascend FlashAttention backend.
+
+    Key initialization logic:
+
+    * ``decode_threshold`` is derived from
+      :func:`~vllm_ascend.spec_decode.speculative_token_tree.get_speculative_tree_len`,
+      which reads ``speculative_config.tree_len`` (if tree attention is active)
+      or falls back to ``1 + num_speculative_tokens``.
+    * ``reorder_batch_threshold`` is set to ``decode_threshold``.
+    * NPU TND layout limit: ``decode_threshold`` must be ≤ 16.
     """
 
     # Does this backend/builder reorder the batch?
@@ -244,10 +319,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         )
 
         self.speculative_config = vllm_config.speculative_config
-        self.decode_threshold = 1
+        from vllm_ascend.spec_decode.speculative_token_tree import (
+            attach_speculative_tree_metadata,
+            get_speculative_tree_len,
+        )
+        attach_speculative_tree_metadata(vllm_config)
+        self.decode_threshold = get_speculative_tree_len(self.speculative_config)
         if self.speculative_config:
-            spec_token_num = self.speculative_config.num_speculative_tokens
-            self.decode_threshold += spec_token_num
             assert self.decode_threshold <= 16, (
                 f"decode_threshold exceeded \
                 npu_fused_infer_attention_score TND layout's limit of 16, \
@@ -266,11 +344,25 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
+        """This backend always supports CUDA graph capture.
+
+        Examples
+        --------
+        >>> AscendAttentionMetadataBuilder.get_cudagraph_support(None, None)
+        <AttentionCGSupport.ALWAYS: 2>
+        """
         # Explicit override in case the underlying builder specialized this getter.
         # @override omitted only because of mypy limitation due to type variable.
         return AttentionCGSupport.ALWAYS
 
     def reorder_batch(self, input_batch, scheduler_output: "SchedulerOutput") -> bool:
+        """This builder never reorders the batch.
+
+        Examples
+        --------
+        >>> builder.reorder_batch(None, None)
+        False
+        """
         return False
 
     def build(
@@ -279,6 +371,16 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
     ) -> AscendMetadata:
+        """Build per-layer ``AscendMetadata`` from common attention metadata.
+
+        Calls ``split_decodes_and_prefills`` with ``self.decode_threshold``
+        (derived from tree config), then assembles an ``AscendMetadata``
+        dataclass with attention mask, KV-cache pointers, and sequence
+        metadata.
+
+        Returns an ``AscendMetadata`` with ``is_tree_mask=False`` (tree
+        masks are only attached by :meth:`build_for_drafting`).
+        """
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
@@ -371,11 +473,95 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         )
         return attn_metadata
 
+    def build_for_drafting(
+        self,
+        draft_index: int,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> AscendMetadata:
+        """Build per-draft-step metadata with tree attention bias.
+
+        Aligns with upstream ``TreeAttentionMetadataBuilder.build_for_drafting``:
+
+        * ``draft_index == 0`` — prefill step, no tree bias (regular causal).
+        * ``draft_index > 0``  — decode step, slice ``tree_attn_bias`` for the
+          current drafting range.
+
+        The sliced bias replaces ``attn_mask`` and sets ``is_tree_mask=True``
+        so the forward pass dispatches to the in-house Triton kernel, which
+        consumes the bias directly as ``qq_bias``.
+
+        Examples
+        --------
+        Assuming the config was populated by
+        :func:`~vllm_ascend.spec_decode.speculative_token_tree.attach_speculative_tree_metadata`
+        with a tree ``[(0,), (0,0), (0,1)]`` (``drafts_per_level = [1, 2]``):
+
+        >>> # draft_index=0 → prefill (no tree mask)# doctest: +SKIP
+        >>> meta_prefill = builder.build_for_drafting(0, common_meta)
+        >>> meta_prefill.is_tree_mask
+        False
+
+        >>> # draft_index=1 → level-1 decode (1 token, 1×1 mask)# doctest: +SKIP
+        >>> meta_l1 = builder.build_for_drafting(1, common_meta_l1)
+        >>> meta_l1.is_tree_mask
+        True
+        >>> meta_l1.attn_mask.shape
+        torch.Size([1, 1])
+
+        >>> # draft_index=2 → level-2 decode (2 sibling tokens, 2×2 mask)# doctest: +SKIP
+        >>> meta_l2 = builder.build_for_drafting(2, common_meta_l2)
+        >>> meta_l2.is_tree_mask
+        True
+        >>> meta_l2.attn_mask.shape
+        torch.Size([2, 2])
+        >>> torch.isneginf(meta_l2.attn_mask[0, 1])  # siblings masked
+        True
+        """
+        attn_metadata = self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
+
+        if draft_index <= 0 or self.speculative_config is None:
+            return attn_metadata
+
+        tree_attn_bias = getattr(self.speculative_config, "tree_attn_bias", None)
+        if tree_attn_bias is None:
+            return attn_metadata
+
+        drafts_per_level = getattr(self.speculative_config, "drafts_per_level", None)
+        cu_drafts_per_level = getattr(self.speculative_config, "cu_drafts_per_level", None)
+
+        if drafts_per_level is None or cu_drafts_per_level is None:
+            return attn_metadata
+        if draft_index > len(drafts_per_level):
+            return attn_metadata
+
+        level_idx = draft_index - 1
+        offset = cu_drafts_per_level[level_idx]
+        query_len = drafts_per_level[level_idx]
+
+        # Slice tree bias: skip root (index 0), take [1+offset : 1+offset+query_len]
+        start = 1 + offset
+        end = start + query_len
+        tree_mask = tree_attn_bias[start:end, start:end].contiguous()
+
+        attn_metadata.attn_mask = tree_mask
+        attn_metadata.is_tree_mask = True
+
+        return attn_metadata
+
     def build_for_graph_capture(
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
         attn_state: AscendAttentionState = AscendAttentionState.DecodeOnly,
     ):
+        """Build dummy metadata for CUDA-graph capture.
+
+        Supports DecodeOnly, ChunkedPrefill, and SpecDecoding states.
+        Uses the same ``build()`` path as live inference, with
+        ``attn_state`` overridden after construction.
+        """
         if attn_state in (
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.ChunkedPrefill,
@@ -1294,6 +1480,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = value[:num_tokens]
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
+            # NOTE: The sinks (learnable-sink) path uses the V2 attention API
+            # and does NOT check is_tree_mask.  Tree attention and learnable
+            # sinks are mutually exclusive — if both are enabled, the tree
+            # bias is forwarded as atten_mask but with sparse_mode=3/4, and
+            # the NPU V2 kernel will NOT apply the tree-structured mask.
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 actual_seq_qlen = torch.tensor([1] * len(attn_metadata.seq_lens_list), dtype=torch.int32).cumsum(dim=0)
@@ -1320,7 +1511,100 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 learnable_sink=self.sinks,
             )
         else:
-            if not attn_metadata.causal:
+            # NOTE: This branch is only reached when self.sinks is None —
+            # the sinks path (above) takes priority and does not support
+            # tree attention.
+            if attn_metadata.is_tree_mask:
+                # Tree attention with prefill/decode split (aligns with upstream
+                # be0dcc29d:tree_attn.py — same kernel called twice). The batch
+                # is decode-first reordered (reorder_batch_threshold=tree_len):
+                # the first ``num_decode_tokens`` tokens (``num_decodes`` seqs)
+                # are tree-decode rows carrying qq_bias; the remainder are plain
+                # causal prefill rows (qq_bias=None). Both sub-batches run
+                # through the SAME in-house varlen Triton kernel.
+                tree_mask = attn_metadata.attn_mask
+                from vllm_ascend.ops.triton.unified_attention import (
+                    tree_unified_attention_varlen,
+                )
+                num_decodes = attn_metadata.num_decodes
+                num_decode_tokens = attn_metadata.num_decode_tokens
+                # ``actual_seq_lengths_q`` is the cumulative query-token count
+                # (no leading 0); prepend 0 to get per-seq boundaries.
+                cum_q = list(attn_metadata.actual_seq_lengths_q)
+                query_loc_all = [0] + cum_q
+                num_query_tokens = int(cum_q[-1])
+                seq_lens_all = attn_metadata.seq_lens_list
+
+                attn_output = torch.empty_like(query[:num_query_tokens])
+
+                # ---- Decode sub-batch: varlen kernel WITH qq_bias ----
+                if num_decodes > 0:
+                    dec_bounds = query_loc_all[: num_decodes + 1]
+                    dec_seq_lens = torch.tensor(
+                        seq_lens_all[:num_decodes], dtype=torch.int32,
+                        device=query.device,
+                    )
+                    dec_ctx = torch.tensor(
+                        [seq_lens_all[i] - (query_loc_all[i + 1] - query_loc_all[i])
+                         for i in range(num_decodes)],
+                        dtype=torch.int32, device=query.device,
+                    )
+                    dec_max_q = max(
+                        query_loc_all[i + 1] - query_loc_all[i]
+                        for i in range(num_decodes)
+                    )
+                    out_dec = tree_unified_attention_varlen(
+                        q=query[:num_decode_tokens],
+                        k_cache=self.key_cache,
+                        v_cache=self.value_cache,
+                        block_table=block_table[:num_decodes],
+                        cu_seqlens_q=torch.tensor(
+                            dec_bounds, dtype=torch.int32, device=query.device),
+                        seq_lens=dec_seq_lens,
+                        context_lens=dec_ctx,
+                        max_query_len=dec_max_q,
+                        qq_bias=tree_mask,
+                        scale=self.scale,
+                        block_size=block_size,
+                        num_kv_heads=self.num_kv_heads,
+                    )
+                    attn_output[:num_decode_tokens] = out_dec
+
+                # ---- Prefill sub-batch: SAME varlen kernel, qq_bias=None ----
+                if num_query_tokens > num_decode_tokens:
+                    np_seqs = len(seq_lens_all) - num_decodes
+                    pf_bounds = [c - num_decode_tokens
+                                 for c in query_loc_all[num_decodes:]]
+                    pf_seq_lens = torch.tensor(
+                        seq_lens_all[num_decodes:], dtype=torch.int32,
+                        device=query.device,
+                    )
+                    pf_ctx = torch.tensor(
+                        [seq_lens_all[num_decodes + j]
+                         - (pf_bounds[j + 1] - pf_bounds[j])
+                         for j in range(np_seqs)],
+                        dtype=torch.int32, device=query.device,
+                    )
+                    pf_max_q = max(
+                        pf_bounds[j + 1] - pf_bounds[j] for j in range(np_seqs)
+                    )
+                    out_pf = tree_unified_attention_varlen(
+                        q=query[num_decode_tokens:num_query_tokens],
+                        k_cache=self.key_cache,
+                        v_cache=self.value_cache,
+                        block_table=block_table[num_decodes:],
+                        cu_seqlens_q=torch.tensor(
+                            pf_bounds, dtype=torch.int32, device=query.device),
+                        seq_lens=pf_seq_lens,
+                        context_lens=pf_ctx,
+                        max_query_len=pf_max_q,
+                        qq_bias=None,
+                        scale=self.scale,
+                        block_size=block_size,
+                        num_kv_heads=self.num_kv_heads,
+                    )
+                    attn_output[num_decode_tokens:num_query_tokens] = out_pf
+            elif not attn_metadata.causal:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
