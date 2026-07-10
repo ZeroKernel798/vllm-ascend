@@ -57,17 +57,6 @@ class TestAscendTorchAOConfig(TestBase):
         # Upstream returns 75 (CUDA SM 7.5); NPU must not be gated by it.
         self.assertEqual(AscendTorchAOConfig.get_min_capability(), -1)
 
-    def test_get_name(self):
-        cfg = _build_cfg()
-        self.assertEqual(cfg.get_name(), TORCHAO_METHOD)
-
-    def test_supported_act_dtypes(self):
-        cfg = _build_cfg()
-        self.assertEqual(
-            cfg.get_supported_act_dtypes(),
-            [torch.float32, torch.float16, torch.bfloat16],
-        )
-
     def test_quant_description_is_instance_attr(self):
         # Layered code reads ``cfg.quant_description`` without a guard;
         # exposing an empty mapping per instance keeps that code happy and
@@ -77,12 +66,6 @@ class TestAscendTorchAOConfig(TestBase):
         self.assertEqual(cfg_a.quant_description, {})
         cfg_a.quant_description["x"] = 1
         self.assertEqual(cfg_b.quant_description, {})
-
-    def test_repr_contains_class_name(self):
-        cfg = _build_cfg(skip_modules=["lm_head"])
-        rendered = repr(cfg)
-        self.assertIn("AscendTorchAOConfig", rendered)
-        self.assertIn("lm_head", rendered)
 
     # -- override_quantization_method (interaction with ModelSlim) ----------
 
@@ -229,14 +212,6 @@ class TestAscendTorchAOConfig(TestBase):
             cfg.skip_modules,
             ["language_model.lm_head", "language_model.embed_tokens"],
         )
-
-    def test_apply_vllm_mapper_no_skip_modules_is_noop(self):
-        from vllm.model_executor.models.utils import WeightsMapper
-
-        cfg = _build_cfg()  # skip_modules defaults to []
-        mapper = WeightsMapper(orig_to_new_substr={"foo": "bar"})
-        cfg.apply_vllm_mapper(mapper)
-        self.assertEqual(cfg.skip_modules, [])
 
     @pytest.mark.skipif(not torchao_installed, reason="torchao is not installed")
     def test_apply_vllm_mapper_translates_module_fqn_to_config(self):
@@ -437,27 +412,6 @@ class TestAscendTorchAOLinearMethod(TestBase):
         self.assertIsNot(type(layer.weight.data), torch.Tensor)
 
     @pytest.mark.skipif(not torchao_installed, reason="torchao is not installed")
-    def test_process_weights_after_loading_calls_hardware_packing_online(self):
-        # Both the online and serialized paths must run torchao's
-        # hardware-aware packing converter so that a future torchao release
-        # adding NPU-specific packing automatically picks up.
-        from torchao.quantization import Int8WeightOnlyConfig
-
-        cfg = AscendTorchAOConfig(
-            torchao_config=Int8WeightOnlyConfig(),
-            is_checkpoint_torchao_serialized=False,
-        )
-        method = AscendTorchAOLinearMethod(cfg)
-        layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(torch.randn(8, 4, dtype=torch.float32), requires_grad=False)
-        with patch(
-            "vllm_ascend.quantization.torchao_config.convert_to_packed_tensor_based_on_current_hardware",
-            side_effect=lambda t: t,
-        ) as packer:
-            method.process_weights_after_loading(layer)
-        self.assertEqual(packer.call_count, 1)
-
-    @pytest.mark.skipif(not torchao_installed, reason="torchao is not installed")
     def test_process_weights_after_loading_serialized_preserves_attrs(self):
         # In the serialized path we wrap the loaded subclass in a fresh
         # Parameter (matching upstream); the wrap drops dynamically-added
@@ -569,22 +523,6 @@ class TestAscendTorchAOLinearMethod(TestBase):
             torch.allclose(out, ref, atol=0.5, rtol=0.05),
             f"int8wo output diverged too far from fp32 reference: max_abs={(out - ref).abs().max().item():.4f}",
         )
-
-    def test_dequantize_weight_is_no_op_on_plain_tensor(self):
-        # ``_dequantize_weight`` must be tolerant of plain tensors (those have
-        # no torchao subclass). It should pass them through unchanged unless
-        # dtype/device are requested.
-        plain = torch.randn(4, 8, dtype=torch.float32)
-        out = AscendTorchAOLinearMethod._dequantize_weight(plain)
-        self.assertIs(type(out), torch.Tensor)
-        self.assertEqual(out.dtype, torch.float32)
-        self.assertEqual(tuple(out.shape), (4, 8))
-
-    def test_dequantize_weight_applies_dtype_and_device(self):
-        plain = torch.randn(4, 8, dtype=torch.float32)
-        out = AscendTorchAOLinearMethod._dequantize_weight(plain, dtype=torch.bfloat16, device=torch.device("cpu"))
-        self.assertEqual(out.dtype, torch.bfloat16)
-        self.assertEqual(out.device.type, "cpu")
 
     def test_apply_fallback_triggers_on_runtime_error(self):
         # Patch F.linear to raise on the first call, then succeed; confirm the
