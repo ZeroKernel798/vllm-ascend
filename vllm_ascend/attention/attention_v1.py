@@ -21,6 +21,9 @@ from enum import Enum
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
+
+# Tree attention uses the in-house Triton kernel (tree_unified_attention_*).
+_USE_TRITON_TREE_ATTENTION = True
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv

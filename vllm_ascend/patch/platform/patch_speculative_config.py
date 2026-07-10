@@ -156,3 +156,21 @@ def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
 
 
 SpeculativeConfig.hf_config_override = hf_config_override
+
+# --- Restore speculative_token_tree field (deleted upstream in PR #42121) ---
+# pydantic dataclass rejects unknown kwargs at init, so we wrap __init__:
+# strip the field from kwargs before original init, then setattr afterwards.
+import dataclasses
+import functools
+from typing import Optional
+
+_original_init = SpeculativeConfig.__init__
+
+@functools.wraps(_original_init)
+def _patched_init(self, *args, **kwargs):
+    tree = kwargs.pop("speculative_token_tree", None)
+    _original_init(self, *args, **kwargs)
+    if tree is not None:
+        object.__setattr__(self, "speculative_token_tree", tree)
+
+SpeculativeConfig.__init__ = _patched_init
