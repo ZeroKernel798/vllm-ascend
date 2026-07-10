@@ -232,21 +232,21 @@ def run_setup(model, *, quantize, native, label, prefill_args, decode_args) -> d
 
 def compare_accuracy(ref_outs, outs) -> dict:
     n = min(len(ref_outs), len(outs))
-    exact = first16 = first32 = 0
+    exact = first1 = first10 = 0
     ratios = []
     for i in range(n):
         b, q = ref_outs[i]["token_ids"], outs[i]["token_ids"]
         if b == q:
             exact += 1
-        if b[:16] == q[:16]:
-            first16 += 1
-        if b[:32] == q[:32]:
-            first32 += 1
+        if b[:1] == q[:1]:
+            first1 += 1
+        if b[:10] == q[:10]:
+            first10 += 1
         ratios.append(difflib.SequenceMatcher(None, ref_outs[i]["text"], outs[i]["text"]).ratio())
     return dict(n=n,
                 exact_match_rate=exact / n if n else 0.0,
-                first16_match_rate=first16 / n if n else 0.0,
-                first32_match_rate=first32 / n if n else 0.0,
+                first1_match_rate=first1 / n if n else 0.0,
+                first10_match_rate=first10 / n if n else 0.0,
                 avg_text_similarity=sum(ratios) / len(ratios) if ratios else 0.0)
 
 

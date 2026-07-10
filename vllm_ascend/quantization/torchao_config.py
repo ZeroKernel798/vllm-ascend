@@ -79,7 +79,15 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.fused_moe import FusedMoE
+# vllm >= 0.24 renamed the FusedMoE class to a factory function;
+# detect MoE layers through the concrete runner classes.
+import vllm_ascend.utils as _utils
+if _utils.vllm_version_is("0.23.0"):
+    from vllm.model_executor.layers.fused_moe import FusedMoE
+    _FUSED_MOE_TYPES = (FusedMoE,)
+else:
+    from vllm.model_executor.layers.fused_moe import MoERunner, RoutedExperts
+    _FUSED_MOE_TYPES = (MoERunner, RoutedExperts)
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.torchao import (
@@ -287,7 +295,7 @@ class AscendTorchAOConfig(TorchAOConfig):
             # FusedMoEMethodBase, not a linear method. Return the Ascend
             # unquantized MoE method so expert linear layers are still
             # quantized via their own get_quant_method calls.
-            if isinstance(layer, FusedMoE):
+            if isinstance(layer, _FUSED_MOE_TYPES):
                 from vllm_ascend.ops.fused_moe.fused_moe import (
                     AscendUnquantizedFusedMoEMethod,
                 )

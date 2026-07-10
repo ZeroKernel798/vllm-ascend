@@ -109,7 +109,13 @@ def compute_errors(
                 import torch_npu  # noqa: F401
                 from vllm_ascend.quantization.torchao_config import AscendTorchAOConfig, AscendTorchAOLinearMethod
 
-                cfg = AscendTorchAOConfig()
+                import torchao.quantization as tq
+                if config == 'w8a8':
+                    cfg = AscendTorchAOConfig(torchao_config=tq.Int8DynamicActivationInt8WeightConfig())
+                elif config == 'intx4wo':
+                    cfg = AscendTorchAOConfig(torchao_config=tq.IntxWeightOnlyConfig(weight_dtype=torch.int4))
+                else:
+                    cfg = AscendTorchAOConfig()
                 method = AscendTorchAOLinearMethod(cfg)
                 method.process_weights_after_loading(layer)
                 with torch.no_grad():
@@ -158,7 +164,7 @@ def main():
         else:
             ldq = f"{r['lat_dequant_ms']:.3f}" if r.get("lat_dequant_ms") else "-"
             lnat = f"{r['lat_native_ms']:.3f}" if r.get("lat_native_ms") else "-"
-            print(f"{name:<10} {r['dequant_vs_fp32']:>16.6f} {r.get('native_vs_fp32', '-'):>16} {r.get('native_vs_dequant', '-'):>18} {ldq:>12} {lnat:>12}")
+            print(f"{name:<10} {r['dequant_vs_fp32']:>16.6f} {(r.get('native_vs_fp32') or '-'):>16} {(r.get('native_vs_dequant') or '-'):>18} {ldq:>12} {lnat:>12}")
 
     print()
     print("Conclusion: if native_vs_fp32 ≈ dequant_vs_fp32, precision loss is from")
