@@ -18,6 +18,8 @@
 from dataclasses import dataclass
 from enum import Enum
 
+import os
+
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
@@ -60,6 +62,24 @@ from vllm_ascend.utils import weak_ref_tensors
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
+
+# Tree attention flag decoupling (Round 1 review #1):
+# - ENABLE_TREE_ATTENTION: controls mask injection in build_for_drafting
+#   (backend-agnostic; shared by Triton and FIA).
+# - TREE_ATTENTION_MODE: controls dispatch in forward_impl ("fia" or "triton").
+# Backward compat: old VLLM_ASCEND_USE_TRITON_TREE_ATTENTION=1 → MODE=triton,
+#   =0 → MODE=fia (new default).
+_old_use_triton = os.environ.get("VLLM_ASCEND_USE_TRITON_TREE_ATTENTION", None)
+_TREE_ATTENTION_ENABLED = os.environ.get(
+    "VLLM_ASCEND_ENABLE_TREE_ATTENTION",
+    "0" if _old_use_triton == "0" else "1",
+) == "1"
+if _old_use_triton is not None:
+    _TREE_ATTENTION_MODE = "triton" if _old_use_triton == "1" else "fia"
+else:
+    _TREE_ATTENTION_MODE = os.environ.get(
+        "VLLM_ASCEND_TREE_ATTENTION_MODE", "triton"
+    )
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -202,6 +222,10 @@ class AscendMetadata:
     # sliding window attention mask
     swa_mask: torch.Tensor | None = None
 
+    # tree attention fields
+    is_tree_mask: bool = False
+    tree_attn_mask: torch.Tensor | None = None
+
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """
@@ -233,10 +257,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         )
 
         self.speculative_config = vllm_config.speculative_config
-        self.decode_threshold = 1
-        if self.speculative_config:
-            spec_token_num = self.speculative_config.num_speculative_tokens
-            self.decode_threshold += spec_token_num
+        from vllm_ascend.spec_decode.speculative_token_tree import (  # lazy — avoid circular import via eagle_proposer
+            attach_speculative_tree_metadata,
+            get_speculative_tree_len,
+        )
+        attach_speculative_tree_metadata(vllm_config)
+        self.decode_threshold = get_speculative_tree_len(self.speculative_config)
+        if self.speculative_config and self.decode_threshold > 16:
             assert self.decode_threshold <= 16, (
                 f"decode_threshold exceeded \
                 npu_fused_infer_attention_score TND layout's limit of 16, \
@@ -322,6 +349,35 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
         )
+        return attn_metadata
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        draft_index: int,
+    ) -> AscendMetadata:
+        """Override base to inject tree attention mask for tree draft steps.
+
+        Called per draft step (already invoked by eagle_proposer.py:1271).
+        For draft_index > 0 with tree config active, slices the per-level
+        tree_attn_bias and sets is_tree_mask=True.
+        """
+        attn_metadata = super().build_for_drafting(common_attn_metadata, draft_index)
+        # Mask injection: controlled by _TREE_ATTENTION_ENABLED (backend-agnostic).
+        # Dispatch (Triton vs FIA) is handled separately in forward_impl.
+        if (
+            _TREE_ATTENTION_ENABLED
+            and self.speculative_config
+            and draft_index > 0
+        ):
+            bias_slices = getattr(self.speculative_config, "tree_attn_bias_slices", None)
+            # Only activate tree attention for branching trees (drafts_per_level > 1).
+            # Linear chains use standard FIA/PA path.
+            drafts = getattr(self.speculative_config, "drafts_per_level", [])
+            is_branching = any(d > 1 for d in drafts)
+            if is_branching and bias_slices is not None and len(bias_slices) >= draft_index:
+                attn_metadata.tree_attn_mask = bias_slices[draft_index - 1]
+                attn_metadata.is_tree_mask = True
         return attn_metadata
 
     def build_for_graph_capture(
@@ -919,6 +975,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
+
+        # ---- Tree attention early-return: dispatch by _TREE_ATTENTION_MODE ----
+        if _TREE_ATTENTION_ENABLED and attn_metadata.is_tree_mask:
+            if _TREE_ATTENTION_MODE == "triton":
+                return self._forward_tree_attention(query, key, value, kv_cache, attn_metadata, output)
+            else:
+                # _TREE_ATTENTION_MODE == "fia" (default)
+                return self._forward_tree_attention_fia(query, key, value, kv_cache, attn_metadata, output)
+
         if (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and using_paged_attention(num_tokens, self.vllm_config)
@@ -927,6 +992,193 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output = self.forward_paged_attention(query, attn_metadata, output)
         else:
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output)
+
+        return output
+
+    def _forward_tree_attention_fia(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Tree attention via CANN FIA standard causal decode (Phase 1).
+
+        Uses standard FIA causal (``sparse_mode=3``) **without** custom tree
+        mask.  CANN FIA hard constraints (verified on CANN 26.0.rc1):
+        - ``sparse_mode=0`` does not support ``atten_mask``
+        - ``sparse_mode=3`` requires mask ``[2048, 2048]``
+        - The ``[2048, 2048]`` mask is shared across all sequences
+          → per-seq tree masks are not encodable in a single shared mask
+
+        This path is equivalent to the Triton tree kernel for
+        **single-parent-chain trees** (eagle3 default: all drafts are
+        ancestors of all later drafts).  For complex multi-branch trees
+        (e.g. ``drafts_per_level=[1,2,1]``), earlier non-ancestor draft
+        tokens will receive cross-branch attention — a correctness
+        concession that is acceptable for the Phase 1 baseline.
+
+        Graph capture is **not** supported (eager-only).
+
+        Prefill sub-batch uses standard FIA causal.
+        """
+        # Graph capture not supported for per-level tree attention (risk #7).
+        if _EXTRA_CTX.capturing:
+            raise NotImplementedError(
+                "Tree attention with FIA does not support graph capture. "
+                "Set VLLM_ASCEND_ENABLE_TREE_ATTENTION=0 to disable tree "
+                "attention under graph capture, or run in eager mode."
+            )
+
+        key_cache, value_cache = kv_cache[0], kv_cache[1]
+        block_tables = attn_metadata.block_tables
+        seq_lens = attn_metadata.seq_lens
+        query_start_loc = attn_metadata.query_start_loc
+        num_decodes = attn_metadata.num_decodes
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_prefills = attn_metadata.num_prefills
+
+        # Compute per-seq context lengths
+        num_seqs = query_start_loc.shape[0] - 1
+        q_lens = query_start_loc[1:] - query_start_loc[:-1]
+        if seq_lens.device != q_lens.device:
+            seq_lens = seq_lens.to(q_lens.device)
+
+        # Prepare reshaped KV cache for FIA
+        num_block, block_size, _, _ = key_cache.shape
+        k_fia = key_cache.view(num_block, block_size, -1)
+        v_fia = value_cache.view(num_block, block_size, -1)
+
+        # ---- Decode sub-batch: standard FIA causal (no custom tree mask) ----
+        if num_decodes > 0 and num_decode_tokens > 0:
+            decode_q = query[:num_decode_tokens]
+
+            decode_attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                query=decode_q,
+                key=k_fia,
+                value=v_fia,
+                atten_mask=attn_metadata.attn_mask,
+                block_table=block_tables[:num_decodes],
+                input_layout="TND",
+                block_size=block_size,
+                actual_seq_lengths=query_start_loc[:num_decodes + 1].tolist(),
+                actual_seq_lengths_kv=seq_lens[:num_decodes].tolist(),
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                sparse_mode=3,
+            )
+            output[:num_decode_tokens] = decode_attn_output[:num_decode_tokens]
+
+        # ---- Prefill sub-batch: standard FIA causal ----
+        if num_prefills > 0:
+            prefill_start = num_decode_tokens
+            prefill_q = query[prefill_start:]
+            prefill_num_tokens = prefill_q.shape[0]
+            if prefill_num_tokens > 0:
+                prefill_seqs = block_tables[num_decodes:]
+                prefill_seq_lens = seq_lens[num_decodes:]
+                prefill_q_start = query_start_loc[num_decodes:] - query_start_loc[num_decodes]
+
+                prefill_attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                    query=prefill_q,
+                    key=k_fia,
+                    value=v_fia,
+                    atten_mask=attn_metadata.attn_mask,
+                    block_table=prefill_seqs,
+                    input_layout="TND",
+                    block_size=block_size,
+                    actual_seq_lengths=prefill_q_start.tolist(),
+                    actual_seq_lengths_kv=prefill_seq_lens.tolist(),
+                    num_key_value_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    scale=self.scale,
+                    sparse_mode=3,
+                )
+                output[prefill_start : prefill_start + prefill_num_tokens] = (
+                    prefill_attn_output[:prefill_num_tokens]
+                )
+
+        return output
+
+    def _forward_tree_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Tree attention path: Triton varlen kernel for decode + prefill sub-batches.
+
+        Decode tokens get tree mask bias (sibling suppression); prefill tokens
+        get linear attention (qq_bias=None). Output is written to ``output``
+        and returned.
+
+        This is the legacy Triton path, kept as fallback (env-var
+        ``VLLM_ASCEND_TREE_ATTENTION_MODE=triton``).  The new default is
+        ``_forward_tree_attention_fia`` (FIA + dense mask).
+        """
+        from vllm_ascend.ops.triton.unified_attention import tree_unified_attention_varlen  # lazy — avoid circular import
+
+        key_cache, value_cache = kv_cache[0], kv_cache[1]
+        block_size = key_cache.shape[1]  # Ascend = 128
+        block_tables = attn_metadata.block_tables
+        seq_lens = attn_metadata.seq_lens
+        query_start_loc = attn_metadata.query_start_loc
+        tree_mask = attn_metadata.tree_attn_mask
+        num_decodes = attn_metadata.num_decodes
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_prefills = attn_metadata.num_prefills
+
+        # Compute per-seq context lengths: context_len = seq_len - query_len
+        num_seqs = query_start_loc.shape[0] - 1
+        q_lens = query_start_loc[1:] - query_start_loc[:-1]
+        # Ensure same device (seq_lens may be CPU, q_lens is NPU)
+        if seq_lens.device != q_lens.device:
+            seq_lens = seq_lens.to(q_lens.device)
+        context_lens = seq_lens[:num_seqs] - q_lens[:num_seqs]
+
+        # Split into decode and prefill sub-batches
+        # Decode sub-batch: first num_decode_tokens, first num_decodes sequences
+        if num_decodes > 0 and num_decode_tokens > 0:
+            decode_q = query[:num_decode_tokens]
+            decode_output = tree_unified_attention_varlen(
+                q=decode_q,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                block_table=block_tables[:num_decodes],
+                cu_seqlens_q=query_start_loc[:num_decodes + 1],
+                seq_lens=seq_lens[:num_decodes],
+                context_lens=context_lens[:num_decodes].to(dtype=torch.int32),
+                max_query_len=int(max(q_lens[:num_decodes]).item()) if num_decodes > 0 else 1,
+                qq_bias=tree_mask,
+                block_size=block_size,
+            )
+            output[:num_decode_tokens] = decode_output
+
+        # Prefill sub-batch: remaining tokens, remaining sequences
+        if num_prefills > 0:
+            prefill_start = num_decode_tokens
+            prefill_q = query[prefill_start:]
+            prefill_num_tokens = prefill_q.shape[0]
+            if prefill_num_tokens > 0:
+                prefill_output = tree_unified_attention_varlen(
+                    q=prefill_q,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    block_table=block_tables[num_decodes:],
+                    cu_seqlens_q=query_start_loc[num_decodes:] - query_start_loc[num_decodes],
+                    seq_lens=seq_lens[num_decodes:],
+                    context_lens=context_lens[num_decodes:].to(dtype=torch.int32),
+                    max_query_len=int(max(q_lens[num_decodes:]).item()) if q_lens[num_decodes:].numel() > 0 else 1,
+                    qq_bias=None,
+                    block_size=block_size,
+                )
+                output[prefill_start : prefill_start + prefill_num_tokens] = prefill_output
 
         return output
 

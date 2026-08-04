@@ -213,3 +213,4 @@ csrc/output/
 
 # claude code skills
 .claude/skills/*
+.remote-logs/

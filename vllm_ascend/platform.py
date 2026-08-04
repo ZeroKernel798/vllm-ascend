@@ -183,10 +183,10 @@ class NPUPlatform(Platform):
         if max_num_seqs is None:
             return None
 
-        decode_query_len = 1
+        from vllm_ascend.spec_decode.speculative_token_tree import get_speculative_tree_len  # lazy to avoid circular import
+
         speculative_config = getattr(vllm_config, "speculative_config", None)
-        if speculative_config and speculative_config.num_speculative_tokens:
-            decode_query_len += speculative_config.num_speculative_tokens
+        decode_query_len = get_speculative_tree_len(speculative_config)
 
         return min(max_num_seqs * decode_query_len, 512)
 

@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.v1.utils import CpuGpuBuffer
 
+from vllm_ascend.spec_decode.speculative_token_tree import get_speculative_tree_len
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
@@ -63,7 +64,9 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_world_rank = dcp_rank
         self.speculative_config = vllm_config.speculative_config
-        self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+        self.decode_threshold = get_speculative_tree_len(self.speculative_config) if self.speculative_config else 1
+        # TODO: audit all decode_threshold users for 'logical step count' vs 'physical slot count' semantics
+        # when tree attention is active with PCP (PLAN step 6). Currently tree_len == 1+num_speculative_tokens for non-tree configs.
         self.vllm_config = vllm_config
         self.max_num_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs

@@ -47,6 +47,11 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.spec_decode.speculative_token_tree import (
+    _compute_child_counts,
+    _compute_drafts_per_level,
+    get_speculative_tree_len,
+)
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
@@ -94,7 +99,7 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         self.use_async_scheduling = self.vllm_config.scheduler_config.async_scheduling
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
-        self.decode_threshold = 1 + self.num_speculative_tokens
+        self.decode_threshold = get_speculative_tree_len(self.speculative_config)
         self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
         self.arange_cpu = torch.arange(self.arange.shape[0], device="cpu", dtype=torch.int32)
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
@@ -186,6 +191,272 @@ class SpecDecodeBaseProposer(EagleProposer):
                 model_config=self.vllm_config.speculative_config.draft_model_config,
             )
         return model
+
+    @staticmethod
+    def _is_tree_spec_config(spec_config) -> bool:
+        """Return True if speculative_config has a branching tree (drafts_per_level > 1)."""
+        if spec_config is None:
+            return False
+        tree = getattr(spec_config, "speculative_token_tree", None)
+        if tree is None:
+            return False
+        drafts = getattr(spec_config, "drafts_per_level", None)
+        if drafts is None:
+            return False
+        return any(d > 1 for d in drafts)
+
+    def _draft_tree_per_level(
+        self,
+        first_draft_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        num_input_tokens: int,
+        token_indices_to_sample: torch.Tensor,
+        common_attn_metadata=None,
+    ) -> torch.Tensor:
+        """Generate draft tokens using per-level tree drafting (v0.18.0 adapted).
+
+        For branched trees (drafts_per_level has values > 1), expands parent
+        tokens per level using child_drafts_per_level, builds per-level
+        attention metadata with tree bias, and samples one token per leaf.
+
+        Adapted from v0.19.1 llm_base_proposer.py — draft_attn_groups /
+        compute_draft_token_ids / reduce_sample paths replaced with v0.18.0
+        equivalents.
+
+        Returns ``[batch_size, num_speculative_tokens]``.
+        """
+        spec_config = self.speculative_config
+        batch_size = first_draft_token_ids.shape[0]
+        forward_context = get_forward_context()
+
+        # Collect all draft tokens: [num_speculative_tokens, batch_size]
+        draft_token_ids_tensor = torch.zeros(
+            (self.num_speculative_tokens, batch_size),
+            dtype=first_draft_token_ids.dtype,
+            device=self.device,
+        )
+        draft_token_ids_tensor[0] = first_draft_token_ids
+
+        # Current level state — one token per request at L0
+        current_tokens = first_draft_token_ids
+        if self.uses_mrope:
+            current_positions = self.mrope_positions[:, token_indices_to_sample]
+        else:
+            current_positions = self.positions[token_indices_to_sample]
+        current_hidden_states = hidden_states[token_indices_to_sample].reshape(batch_size, -1)
+
+        next_draft_idx = 1  # next free row in draft_token_ids_tensor
+
+        # ── optimisation: pre-transfer full tree bias to device once ──
+        full_bias = spec_config.tree_attn_bias
+        full_bias_dev = full_bias.to(self.device, non_blocking=True) if full_bias is not None else None
+
+        # ── optimisation: pre-compute slot_mapping for all BFS drafts ──
+        cu_drafts = spec_config.cu_drafts_per_level
+        total_draft_tokens = cu_drafts[-1]
+        if common_attn_metadata is not None:
+            base_seq = common_attn_metadata.seq_lens[:batch_size]
+            block_table = common_attn_metadata.block_table_tensor[:batch_size]
+            block_size = self.kernel_block_size
+            _all_kv_pos = base_seq.unsqueeze(1) + torch.arange(total_draft_tokens, device=base_seq.device).unsqueeze(0)
+            _exceeds_kv = _all_kv_pos >= self.max_model_len
+            _safe_kv_pos = torch.where(_exceeds_kv, torch.zeros_like(_all_kv_pos), _all_kv_pos)
+            _all_block_ids = block_table.gather(dim=1, index=(_safe_kv_pos // block_size).long())
+            _all_slots = _all_block_ids * block_size + _safe_kv_pos % block_size
+            _all_slots = _all_slots.masked_fill(_exceeds_kv, PADDING_SLOT_ID)
+
+        for level_idx in range(1, spec_config.tree_depth):
+            per_req_counts = spec_config.child_drafts_per_level[level_idx]
+            n_parents_per_req = len(per_req_counts)
+            child_counts = per_req_counts * batch_size
+            total_tokens = sum(child_counts)
+            if total_tokens == 0:
+                break
+
+            # Expand inputs: repeat each parent's data by its child count
+            counts = torch.tensor(child_counts, dtype=torch.long, device=self.device)
+            expanded_tokens = torch.repeat_interleave(current_tokens, counts, dim=0)
+            if self.uses_mrope:
+                expanded_positions = torch.repeat_interleave(
+                    current_positions + 1, counts, dim=1,
+                )
+                exceeds = expanded_positions[0] >= self.max_model_len
+                clamped_positions = torch.where(
+                    exceeds.unsqueeze(0), torch.zeros_like(expanded_positions), expanded_positions,
+                )
+            else:
+                expanded_positions = torch.repeat_interleave(
+                    current_positions + 1, counts, dim=0,
+                )
+                exceeds = expanded_positions >= self.max_model_len
+                clamped_positions = torch.where(exceeds, 0, expanded_positions)
+
+            # Copy to buffers
+            self.input_ids[:total_tokens] = expanded_tokens
+            self._set_positions(total_tokens, clamped_positions)
+            # Only materialise hidden states when the draft model actually
+            # consumes them.  For ``draft_model`` (pass_hidden_states_to_model
+            # =False) this buffer is never read, while``current_hidden_states``
+            # carries the *target* hidden size (e.g. 4096) and the buffer is
+            # sized for the *draft* model (e.g. 896) -- writing it both wastes
+            # bandwidth and raises a shape error on trees whose levels have
+            # differing parent counts.
+            if self.pass_hidden_states_to_model:
+                if current_hidden_states.shape[0] != counts.shape[0]:
+                    logger.error(
+                        "[TREE-DIAG] level=%d batch=%d current_hidden=%s counts=%s "
+                        "child_counts=%s total_tokens=%d buffer=%s",
+                        level_idx, batch_size, tuple(current_hidden_states.shape),
+                        tuple(counts.shape), child_counts, total_tokens,
+                        tuple(self.hidden_states.shape),
+                    )
+                self.hidden_states[:total_tokens] = torch.repeat_interleave(
+                    current_hidden_states, counts, dim=0,
+                )
+
+            # Compute per-request query_start_loc at this level
+            tokens_per_req = [
+                sum(child_counts[r * n_parents_per_req : (r + 1) * n_parents_per_req])
+                for r in range(batch_size)
+            ]
+            # Build on CPU first, then copy to device: tokens_per_req is already
+            # host-side, so this avoids a D2H sync for query_start_loc_cpu.
+            query_start_loc_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
+            query_start_loc_cpu[1:] = torch.tensor(tokens_per_req, dtype=torch.int32).cumsum(0)
+            query_start_loc = query_start_loc_cpu.to(self.device, non_blocking=True)
+
+            _EXTRA_CTX.num_tokens = total_tokens
+            _EXTRA_CTX.num_accept_tokens = total_tokens
+            if forward_context is not None:
+                forward_context.moe_layer_index = 0
+
+            # Build per-level attention metadata with tree bias
+            if common_attn_metadata is not None:
+                level_cad = copy.copy(common_attn_metadata)
+                level_cad.num_reqs = batch_size
+                level_cad.num_actual_tokens = total_tokens
+                level_cad.max_query_len = max(child_counts) if total_tokens > 0 else 1
+                level_cad.query_start_loc = query_start_loc
+                level_cad.query_start_loc_cpu = query_start_loc_cpu
+
+                # KV layout: draft tokens are laid out flat in BFS order after
+                # the context, so draft with BFS index j lives at absolute KV
+                # position ``base_len + j``.  This level's drafts occupy BFS
+                # range [cu_drafts[level_idx], cu_drafts[level_idx + 1]).
+                bfs_start = cu_drafts[level_idx]
+                bfs_end = cu_drafts[level_idx + 1]
+
+                # seq_lens = context + all drafts written up to and including
+                # this level (cumulative, not just this level's count).
+                base_seq = common_attn_metadata.seq_lens[:batch_size]
+                level_cad.seq_lens = base_seq + bfs_end
+                base_seq_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+                if base_seq_cpu is not None:
+                    # Derive from the host copy to avoid a D2H sync per level.
+                    level_cad.seq_lens_cpu = base_seq_cpu[:batch_size] + bfs_end
+
+                # ── optimised: use pre-computed slot_mapping slice ──
+                bfs_start = cu_drafts[level_idx]
+                bfs_end = cu_drafts[level_idx + 1]
+                level_slots = _all_slots[:, bfs_start:bfs_end].reshape(-1).to(torch.int32)
+                self.slot_mapping_group[0][: level_slots.shape[0]].copy_(level_slots)
+                self.slot_mapping_group[0][level_slots.shape[0] :].fill_(PADDING_SLOT_ID)
+                level_cad.slot_mapping = self.slot_mapping_group[0]
+
+                # Use draft attn-group builder (same as _propose)
+                builder = self.draft_attn_groups[0].get_metadata_builder()
+                attn_meta = builder.build(0, level_cad)
+                per_layer = {name: attn_meta for name in self.attn_layer_names}
+
+                # Attach tree bias mask for this level.
+                #
+                # The kernel treats KV[:context_len] as unconditionally visible
+                # context and only applies qq_bias to the query suffix, indexed
+                # by ``kr = k_abs - context_len``.  Since context_len ends right
+                # where this level's drafts begin, column ``kr`` maps to BFS
+                # index ``bfs_start + kr`` — so the bias slice must cover only
+                # this level's own tokens, not all drafts.
+                #
+                # Ancestors from earlier levels sit inside the context region
+                # and are correctly visible without bias; cross-branch ancestors
+                # are the one case this cannot express (see _forward_tree_
+                # attention_fia docstring) and require the verification pass.
+                if full_bias_dev is not None:
+                    lo = 1 + bfs_start
+                    hi = 1 + bfs_end
+                    level_bias = full_bias_dev[lo:hi, lo:hi].contiguous()
+                    for entry in per_layer.values():
+                        entry.tree_attn_mask = level_bias
+                        entry.is_tree_mask = max(child_counts) > 1
+
+                if forward_context is not None:
+                    forward_context.attn_metadata = per_layer
+
+            # Build model inputs and run forward
+            model_input_ids = self.input_ids[:total_tokens]
+            model_positions = self._get_positions(total_tokens)
+            model_kwargs: dict[str, Any] = {
+                "input_ids": model_input_ids,
+                "positions": model_positions,
+                "inputs_embeds": None,
+            }
+            if self.pass_hidden_states_to_model:
+                model_kwargs["hidden_states"] = self.hidden_states[:total_tokens]
+
+            ret_hidden_states = self.model(**model_kwargs)
+            last_hidden_states = ret_hidden_states if not self.model_returns_tuple() else ret_hidden_states[0]
+            # The draft model may return a view of its full padded buffer
+            # rather than exactly ``total_tokens`` rows (observed with eagle3:
+            # 8 rows returned for a level that produced 2 tokens).  The next
+            # level indexes this per-parent, so trim it to the rows this level
+            # actually produced -- otherwise repeat_interleave sees a row count
+            # that disagrees with ``counts`` and aborts the EngineCore.
+            if last_hidden_states.shape[0] > total_tokens:
+                last_hidden_states = last_hidden_states[:total_tokens]
+
+            # Sample tokens — use top-k for branching to produce diverse children.
+            # With repeat_interleave, all children of the same parent receive
+            # identical hidden states → identical logits → identical argmax.
+            # top-k picks the k most likely tokens and assigns them to the k
+            # children, giving each branch a different candidate.
+            logits = self.model.compute_logits(last_hidden_states)
+            flat_child_counts = (
+                child_counts if isinstance(child_counts, list) else child_counts.tolist()  # type: ignore[union-attr]
+            )
+            max_children = max(flat_child_counts) if flat_child_counts else 1
+            if max_children > 1:
+                # ── branching: top-k per token position ──
+                # Row i takes the (rank_i)-th best token, where rank_i is i's
+                # position within its parent's contiguous child group. Built on
+                # the host from static tree metadata — no device sync.
+                _, topk_ids = torch.topk(logits, k=max_children, dim=-1)
+                ranks = [r for n_ch in flat_child_counts for r in range(n_ch)]
+                rank_idx = torch.tensor(ranks, dtype=torch.long).to(self.device, non_blocking=True)
+                new_draft_token_ids = topk_ids.gather(1, rank_idx.unsqueeze(1)).squeeze(1)
+            else:
+                # ── single child per parent: argmax is sufficient ──
+                new_draft_token_ids = logits.argmax(dim=-1)
+
+            # Store tokens into draft_token_ids_tensor
+            cumsum = 0
+            for req_idx in range(batch_size):
+                for par_idx in range(n_parents_per_req):
+                    n_ch = child_counts[req_idx * n_parents_per_req + par_idx]
+                    if n_ch == 0:
+                        continue
+                    draft_token_ids_tensor[next_draft_idx : next_draft_idx + n_ch, req_idx] = (
+                        new_draft_token_ids[cumsum : cumsum + n_ch]
+                    )
+                    cumsum += n_ch
+
+            next_draft_idx += spec_config.drafts_per_level[level_idx]
+
+            # Prepare for next level
+            current_tokens = new_draft_token_ids
+            current_positions = expanded_positions
+            current_hidden_states = last_hidden_states
+
+        return draft_token_ids_tensor.swapaxes(0, 1)
 
     def load_model(self, model: nn.Module) -> None:
         target_attn_layer_names = set(get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys())
@@ -679,8 +950,14 @@ class SpecDecodeBaseProposer(EagleProposer):
                                 per_layer_attn_metadata[layer_name] = attn_metadata
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
-            # Copy the old attn_metadata and update
-            if not self.parallel_drafting:
+            # Copy the old attn_metadata and update.
+            # Tree drafting builds its own per-level metadata in
+            # _draft_tree_per_level and never reads multi_steps_attn_metadata.
+            # Skipping this loop also keeps common_attn_metadata.seq_lens at the
+            # true context length — attn_update_stack_num_spec_norm increments it
+            # in place per step, which would corrupt the tree path's KV position
+            # arithmetic (it derives slot_mapping from seq_lens).
+            if not self.parallel_drafting and not self._is_tree_spec_config(self.speculative_config):
                 for draft_step in range(1, self.num_speculative_tokens):
                     per_layer_attn_metadata = dict()
                     for attn_group in self.draft_attn_groups:
@@ -717,24 +994,57 @@ class SpecDecodeBaseProposer(EagleProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            model_inputs: dict[str, Any] = {
-                "num_input_tokens": num_input_tokens,
-                "batch_size": batch_size,
-                "token_indices_to_sample": self.token_indices_to_sample[:token_indices_to_sample_len],
-                "target_positions": target_positions,
-                "inputs_embeds": inputs_embeds,
-                "multi_steps_attn_metadata": multi_steps_attn_metadata,
-                "num_tokens": num_tokens,
-                "is_prefill": attn_metadata_i.num_prefills,
-            }
-            run_draft = partial(self._runnable, **model_inputs)
-
-            if self.enable_enpu:
-                self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-                draft_token_ids = run_draft()
+            # ---- Tree drafting dispatch (inside forward context) ----
+            if self._is_tree_spec_config(self.speculative_config):
+                # Run the model's first draft step to get valid
+                # first_draft_token_ids.  _runnable loops over
+                # self.num_speculative_tokens steps; limit it to 1
+                # so we only generate the root draft token, then
+                # _draft_tree_per_level handles multi-level expansion.
+                saved_ns = self.num_speculative_tokens
+                first_model_inputs: dict[str, Any] = {
+                    "num_input_tokens": num_input_tokens,
+                    "batch_size": batch_size,
+                    "token_indices_to_sample": self.token_indices_to_sample[:token_indices_to_sample_len],
+                    "target_positions": target_positions,
+                    "inputs_embeds": inputs_embeds,
+                    "multi_steps_attn_metadata": None,  # skip per-step attn for first step
+                    "num_tokens": num_tokens,
+                    "is_prefill": attn_metadata_i.num_prefills,
+                }
+                try:
+                    self.num_speculative_tokens = 1
+                    first_runner = partial(self._runnable, **first_model_inputs)
+                    first_output = first_runner()
+                finally:
+                    self.num_speculative_tokens = saved_ns
+                first_draft_token_ids = first_output[:, 0]
+                draft_token_ids = self._draft_tree_per_level(
+                    first_draft_token_ids=first_draft_token_ids,
+                    hidden_states=self.hidden_states[:num_input_tokens],
+                    num_input_tokens=num_input_tokens,
+                    token_indices_to_sample=token_indices_to_sample,
+                    common_attn_metadata=common_attn_metadata,
+                )
             else:
-                draft_token_ids = run_draft()
-                self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+                model_inputs: dict[str, Any] = {
+                    "num_input_tokens": num_input_tokens,
+                    "batch_size": batch_size,
+                    "token_indices_to_sample": self.token_indices_to_sample[:token_indices_to_sample_len],
+                    "target_positions": target_positions,
+                    "inputs_embeds": inputs_embeds,
+                    "multi_steps_attn_metadata": multi_steps_attn_metadata,
+                    "num_tokens": num_tokens,
+                    "is_prefill": attn_metadata_i.num_prefills,
+                }
+                run_draft = partial(self._runnable, **model_inputs)
+
+                if self.enable_enpu:
+                    self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+                    draft_token_ids = run_draft()
+                else:
+                    draft_token_ids = run_draft()
+                    self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         return draft_token_ids
 
     def _run_merged_draft(
@@ -877,7 +1187,12 @@ class SpecDecodeBaseProposer(EagleProposer):
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
-            self.hidden_states[:batch_size] = hidden_states
+            # Only the draft model consumes hidden states. For `draft_model`
+            # the buffer is never read (pass_hidden_states_to_model=False) and
+            # the draft model's own hidden size differs from the target's, so
+            # skip the copy rather than reallocating the buffer every step.
+            if self.pass_hidden_states_to_model:
+                self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -894,9 +1209,6 @@ class SpecDecodeBaseProposer(EagleProposer):
             # `model_hidden_states` represent the speculative model inputs.
             model_input_ids = self.input_ids[:input_batch_size]
             model_positions = self._get_positions(input_batch_size)
-            model_hidden_states = self.hidden_states[:input_batch_size]
-
-            model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
 
             forward_context.attn_metadata = (
                 multi_steps_attn_metadata[draft_step + 1] if multi_steps_attn_metadata else None
@@ -908,6 +1220,11 @@ class SpecDecodeBaseProposer(EagleProposer):
                 "inputs_embeds": inputs_embeds,
             }
             if self.pass_hidden_states_to_model:
+                model_hidden_states = self.hidden_states[:input_batch_size]
+                model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+                    model_hidden_states, model_positions
+                )
+                model_kwargs["positions"] = model_positions
                 model_kwargs["hidden_states"] = model_hidden_states
 
             ret_hidden_states = self.model(**model_kwargs)
@@ -1043,7 +1360,11 @@ class SpecDecodeBaseProposer(EagleProposer):
                 target_positions = target_positions[0]
 
             self._set_positions(num_tokens, target_positions)
-            self.hidden_states[:num_tokens] = target_hidden_states
+            # Only the draft model consumes hidden states. For `draft_model`
+            # (pass_hidden_states_to_model=False) the buffer is never read, and
+            # target/draft hidden sizes differ, so skip the copy entirely.
+            if self.pass_hidden_states_to_model:
+                self.hidden_states[:num_tokens] = target_hidden_states
 
             return num_tokens, token_indices_to_sample, cad, (query_lens_d, ori_token_indices_to_sample)
         else:

@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -116,6 +117,7 @@ from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
+from vllm_ascend.spec_decode.speculative_token_tree import get_speculative_tree_len
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
 from vllm_ascend.utils import (
@@ -357,7 +359,7 @@ class NPUModelRunner(GPUModelRunner):
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
-        self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+        self.decode_threshold = get_speculative_tree_len(self.speculative_config) if self.speculative_config else 1
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -459,7 +461,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             assert spec_token_num > 0
-            self.decode_token_per_req = 1 + spec_token_num
+            self.decode_token_per_req = get_speculative_tree_len(self.speculative_config)
             if get_pp_group().is_last_rank:
                 self.drafter = self._get_drafter()
                 if self.speculative_config.method == "eagle3":
@@ -1622,6 +1624,19 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
+
+        # Tree spec-decode: remap BFS tree slots onto a single position-aligned
+        # chain before the (linear) rejection sampler sees them.  No-op for
+        # linear chains.See _remap_tree_to_chain for the full rationale.
+        spec_decode_metadata = self._remap_tree_to_chain(spec_decode_metadata, logits)
+
+        #── DIAGNOSTIC (env-gated, off by default) ──
+        # Dumps the actual (draft_token, target_logit_position) pairs the
+        # rejection sampler compares.  Used to prove/disprove that BFS tree
+        # slots are matched against linearly-increasing target positions.
+        if os.environ.get("VLLM_ASCEND_DUMP_SPEC_VERIFY") == "1":
+            self._dump_spec_verify(spec_decode_metadata, logits)
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
@@ -1629,6 +1644,252 @@ class NPUModelRunner(GPUModelRunner):
             sampling_metadata,
         )
         return sampler_output
+
+    _spec_dump_count = 0
+    _tree_remap_meta = None
+
+    def _get_tree_remap_meta(self):
+        """Cache (parent_slots, root_paths, n_slots) or False when not a tree."""
+        if self._tree_remap_meta is not None:
+            return self._tree_remap_meta
+
+        meta = False
+        spec_cfg = getattr(self.vllm_config, "speculative_config", None)
+        parents = getattr(spec_cfg, "tree_parent_slots", None) if spec_cfg else None
+        paths = getattr(spec_cfg, "tree_root_paths", None) if spec_cfg else None
+        if parents and paths:
+            n = len(parents)
+            # A pure chain has parent_slots == (-1, 0, 1, ..., n-2); the linear
+            # indices the sampler already computes are then exactly correct, so
+            # remapping would be a no-op.  Skip it entirely to keep the linear
+            # path byte-for-byte unchanged.
+            is_chain = tuple(parents) == tuple([-1] + list(range(n - 1)))
+            if not is_chain:
+                meta = (tuple(parents), tuple(paths), n)
+        self._tree_remap_meta = meta
+        return meta
+
+    def _remap_tree_to_chain(self, spec_decode_metadata, logits):
+        """Select one root-to-leaf tree path per request, as a linear chain.
+
+        Why this is needed
+        ------------------
+        ``_calc_spec_decode_metadata`` assigns ``target_logits_indices``
+        linearly (0, 1, 2, ...), which encodes "draft slot i predicts
+        position i".  That is true only for a chain.  In a branching tree the
+        BFS slot order interleaves siblings: for``[(0,),(0,0),(0,1)]`` the
+        slots are [root-child, child-of-1, SIBLING-of-1].Slot 2 belongs to
+        position 1 but receives logits index 2, so it is verified against a
+        position it does not belong to.  Measured effect: pos-3 acceptance
+        0.031 for the tree vs 0.318 for the same model on a chain.
+
+        What this does
+        --------------
+        Picks, per request, the root-to-leaf path that the target actually
+        agrees with (greedy match against``target_argmax``, longest prefix
+        wins), then rewrites the metadata so the sampler sees that path as a
+        plain chain.  Positions then line up by construction.
+
+        This deliberately does NOT try to accept multiple branches in one
+        step; it converts the tree into "propose several candidate chains,
+        verify the best one".  The upstream RejectionSampler is strictly
+        linear (asserts ``draft_token_ids.ndim == 1`` and stops at the first
+        mismatch), and making it tree-aware would require changing
+        num_draft_tokens semantics across the scheduler, KV allocation and
+        position encoding.
+
+        No-op for linear chains (see _get_tree_remap_meta).
+        """
+        meta = self._get_tree_remap_meta()
+        if meta is False or logits is None:
+            return spec_decode_metadata
+
+        parent_slots, root_paths, n_slots = meta
+        num_draft = spec_decode_metadata.num_draft_tokens
+        # Only requests carrying a full tree can be remapped.
+        if not any(n == n_slots for n in num_draft):
+            return spec_decode_metadata
+
+        try:
+            import numpy as _np
+
+            device = logits.device
+            draft_ids = spec_decode_metadata.draft_token_ids
+            old_tgt = spec_decode_metadata.target_logits_indices
+
+            num_draft_np = _np.asarray(num_draft, dtype=_np.int64)
+            starts = _np.concatenate([[0], _np.cumsum(num_draft_np)[:-1]]).tolist()
+
+            n_tok = old_tgt.numel()
+            n_rows = logits.shape[0]
+            # Only remap requests that carry a complete tree AND stay in bounds.
+            # (draft_token_ids can be shorter than sum(num_draft_tokens) in
+            # padded-drafter batches, so bounds must be checked explicitly.)
+            targets = []
+            for st, nd in zip(starts, num_draft):
+                if nd != n_slots or st + nd > n_tok:
+                    continue
+                req_base = int(old_tgt[st].item())
+                if req_base + n_slots > n_rows:
+                    continue
+                targets.append((st, req_base))
+            if not targets:
+                return spec_decode_metadata
+
+            # Step 1: correct index per slot = req_base + parent_slot + 1.
+            # (Target logits at index j predict the token following input j, so
+            # a slot must be scored against the logits produced by its parent.)
+            parent_t = torch.tensor(parent_slots, device=device, dtype=old_tgt.dtype)
+            fixed_tgt = old_tgt.clone()
+            chain_tgt = old_tgt.clone()
+            for st, req_base in targets:
+                fixed_tgt[st : st + n_slots] = req_base + parent_t + 1
+                chain_tgt[st : st + n_slots] = req_base + torch.arange(
+                    n_slots, device=device, dtype=old_tgt.dtype
+                )
+
+            # Step 2: with correct indices, see which candidate path the target
+            # agrees with.  argmax_chain is the argmax at the indices where
+            # verification will actually happen after remapping.
+            argmax_at = logits[fixed_tgt].argmax(dim=-1).tolist()
+            argmax_chain = logits[chain_tgt].argmax(dim=-1).tolist()
+            d_host = draft_ids.tolist()
+
+            new_draft = draft_ids.clone()
+            new_tgt = fixed_tgt.clone()
+            for st, req_base in targets:
+                best, best_matched = root_paths[0], -1
+                for path in root_paths:
+                    matched = 0
+                    for slot in path:
+                        if d_host[st + slot] == argmax_at[st + slot]:
+                            matched += 1
+                        else:
+                            break
+                    if (matched, len(path)) > (best_matched, len(best)):
+                        best, best_matched = path, matched
+                    if matched == len(path):
+                        break
+
+                # CRITICAL: only the accepted prefix that coincides with the
+                # BFS prefix may be kept.
+                #
+                # The target forward consumed the drafts in BFS order, so KV
+                # cache position ``base + j`` holds the K/V of BFS slot``j``.
+                # Accepting n tokens tells the scheduler that base+0..base+n-1
+                # are valid.  If we reordered a non-prefix path (e.g. (0,2))
+                # into chain positions, the reported tokens would no longer
+                # correspond to the cached K/V at those positions, silently
+                # corrupting every later attention for that request.
+                #
+                # Reordering KV is not an option: the cache is written during
+                # the forward, before we know which path the target agrees
+                # with.  So truncate to the longest common prefix with the BFS
+                # order instead -- correctness first; the tree still helps by
+                # letting the *drafter* explore siblings.
+                keep = 0
+                while keep < best_matched and best[keep] == keep:
+                    keep += 1
+
+                for k in range(keep):
+                    new_draft[st + k] = draft_ids[st + best[k]]
+                    new_tgt[st + k] = req_base + k
+
+                # Everything past the kept prefix must be rejected.  Poison
+                # with a token that differs from the argmax at the index that
+                # is actually verified (req_base + k).
+                for k in range(keep, n_slots):
+                    new_tgt[st + k] = req_base + k
+                    new_draft[st + k] = (argmax_chain[st + k] + 1) % self.input_batch.vocab_size
+
+                # Lay the chosen path out as a contiguous chain: the k-th node
+                # of the path moves to slot k with logits index req_base + k.
+                for k, slot in enumerate(best):
+                    new_draft[st + k] = draft_ids[st + slot]
+                    new_tgt[st + k] = req_base + k
+
+                # Slots past the end of the chosen path belong to other
+                # branches and must not be accepted.  Poison them with a token
+                # that differs from the argmax at the index actually verified
+                # (req_base + k), so the sampler truncates here.
+                # num_draft_tokens is deliberately left UNCHANGED so KV
+                # rollback still accounts for every slot written to the cache.
+                for k in range(len(best), n_slots):
+                    new_tgt[st + k] = req_base + k
+                    new_draft[st + k] = (argmax_chain[st + k] + 1) % self.input_batch.vocab_size
+
+            from dataclasses import replace as _replace
+
+            return _replace(
+                spec_decode_metadata,
+                draft_token_ids=new_draft.contiguous(),
+                target_logits_indices=new_tgt.contiguous(),
+            )
+        except Exception as e:
+            # Loud + once-per-process: a silent fallback here would look like a
+            # legitimate "tree has no benefit" measurement.
+            if not getattr(self, "_tree_remap_warned", False):
+                self._tree_remap_warned = True
+                logger.error(
+                    "tree->chain remap FAILED (%r); tree results are INVALID "
+                    "(falling back to linear verification)",
+                    e,
+                    exc_info=True,
+                )
+            return spec_decode_metadata
+
+    def _dump_spec_verify(self, spec_decode_metadata, logits) -> None:
+        """One-shot dump of what the rejection sampler actually compares."""
+        if type(self)._spec_dump_count >= 3:
+            return
+        type(self)._spec_dump_count += 1
+        try:
+            import ast
+
+            spec_cfg = self.vllm_config.speculative_config
+            tree_str = getattr(spec_cfg, "speculative_token_tree", None) if spec_cfg else None
+            tree = ast.literal_eval(tree_str) if tree_str else None
+
+            draft = spec_decode_metadata.draft_token_ids.tolist()
+            tgt_idx = spec_decode_metadata.target_logits_indices.tolist()
+            num_draft = spec_decode_metadata.num_draft_tokens
+            tgt_argmax = logits.argmax(dim=-1).tolist()
+
+            lines = [
+                "",
+                "=" * 72,
+                f"[SPEC-VERIFY DUMP #{type(self)._spec_dump_count}]",
+                f"  tree_str            = {tree_str}",
+                f"  num_draft_tokens    = {num_draft}",
+                f"  target_logits_idx   = {tgt_idx}",
+                f"  draft_token_ids     = {draft}",
+                "-" * 72,
+            ]
+            if tree:
+                depths = [len(p) for p in tree]
+                lines.append(f"  tree slot depths    = {depths}  (BFS order)")
+                lines.append(
+                    "  slot | tree_pos | linear_pos | draft_tok | target_argmax@linear | match"
+                )
+                n = len(tree)
+                for req in range(len(num_draft)):
+                    base = sum(num_draft[:req])
+                    if num_draft[req] == 0:
+                        continue
+                    for s in range(min(n, num_draft[req])):
+                        gi = base + s
+                        if gi >= len(draft) or gi >= len(tgt_idx):
+                            break
+                        li = tgt_idx[gi]
+                        ta = tgt_argmax[li] if li < len(tgt_argmax) else -1
+                        lines.append(
+                            f"  r{req}s{s + 1} | {depths[s] - 1:8d} | {s:10d} | "
+                            f"{draft[gi]:9d} | {ta:20d} | {'HIT' if draft[gi] == ta else 'miss'}"
+                        )
+            lines.append("=" * 72)
+            logger.info("\n".join(lines))
+        except Exception as e:  # diagnostic must never break the run
+            logger.warning("spec-verify dump failed: %s", e)
 
     # TODO: remove this func after eagle_proposer is refactored and
     #  _bookkeeping_sync is moved after propose_draft_token_ids
